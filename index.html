@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Hyper Viper Remastered v0.98.54</title>
+<title>Hyper Viper Remastered v0.99.18 - Tactical Attack AI</title>
 <style>
   :root { --px: 3px; }
   * { box-sizing: border-box; }
@@ -45,14 +45,17 @@
 <body>
 <div class="wrap">
   <h1>HYPER VIPER</h1>
-  <div class="sub">Remastered v0.98.54 - Evolving Coordinated Brain</div>
-  <canvas class="bitmap-hud" id="bitmapHud" width="512" height="32" aria-label="Score, lives, vipers and level"></canvas>
+  <div class="sub">Remastered v0.99.18 - Tactical Attack AI</div>
+  <canvas class="bitmap-hud" id="bitmapHud" width="512" height="32" aria-label="Player scores, lives, vipers and level"></canvas>
   <canvas id="game" width="512" height="384" aria-label="Hyper Viper game"></canvas>
   <div class="help">
-    ARROW KEYS / WASD OR CLICK / TAP: CHANGE DIRECTION - P: PAUSE - R: NEW GAME<br>
-    THE PLAYER MOVES CONTINUOUSLY. THE SCORPION DROPS FRUIT AND LATER LAYS EGGS THAT HATCH INTO HUNTERS.
+    1: SOLO - 2: DUO - 3: SOLO + AI - 4: DUO + AI - P: PAUSE<br>
+    P1: WASD. P2: ARROWS. SOLO ALSO USES ARROWS. CLICK / TAP SELECTS A HUMAN PLAYER.
   </div>
-  <button id="restart">NEW GAME</button>
+  <button id="onePlayer">1 PLAYER</button>
+  <button id="twoPlayers">2 PLAYERS</button>
+  <button id="onePlayerAi">1 + AI</button>
+  <button id="twoPlayersAi">2 + AI</button>
 </div>
 
 <script>
@@ -251,7 +254,7 @@
   }
 
 
-  const maze = [
+  const CLASSIC_MAZE = [
 "################################",
 "#..............##..............#",
 "#.######.#####.##.#####.######.#",
@@ -277,9 +280,875 @@
 "#..............##..............#",
 "################################"
   ].map(r => r.slice(0,COLS).padEnd(COLS,'#'));
+  let maze=[...CLASSIC_MAZE];
+  let mazeRevision=0;
+  let mazeRunSeed=0x48565052;
+  const MAZE_COLOR_THEMES=[
+    {
+      name:'green',
+      filter:'none',
+      fallbackOuter:'#35a854',
+      fallbackInner:'#0d5428'
+    },
+    {
+      name:'orange',
+      filter:'hue-rotate(270deg) saturate(1.18) brightness(1.06)',
+      fallbackOuter:'#d86b24',
+      fallbackInner:'#71300b'
+    },
+    {
+      name:'blue-violet',
+      filter:'hue-rotate(135deg) saturate(1.22) brightness(1.08)',
+      fallbackOuter:'#6857e8',
+      fallbackInner:'#25166f'
+    },
+    {
+      name:'ruby-red',
+      filter:'hue-rotate(230deg) saturate(1.24) brightness(1.06)',
+      fallbackOuter:'#d94b61',
+      fallbackInner:'#6d1427'
+    },
+    {
+      name:'turquoise',
+      filter:'hue-rotate(65deg) saturate(1.16) brightness(1.08)',
+      fallbackOuter:'#24b7b0',
+      fallbackInner:'#075b59'
+    },
+    {
+      name:'gold',
+      filter:'hue-rotate(290deg) saturate(1.12) brightness(1.08)',
+      fallbackOuter:'#d7ad2f',
+      fallbackInner:'#6c4d08'
+    }
+  ];
+  let mazeColorTheme=MAZE_COLOR_THEMES[0];
 
-  const PLAYER_START={x:1,y:1};
-  const PLAYER_START_DIR={x:0,y:1};
+  const PLAYER_STARTS=[
+    {x:1,y:1,dir:{x:0,y:1}},
+    {x:COLS-2,y:ROWS-2,dir:{x:0,y:-1}},
+    {x:1,y:ROWS-2,dir:{x:0,y:-1}}
+  ];
+
+  function seededMazeRandom(seed){
+    let state=seed>>>0;
+    return ()=>{
+      state=(state+0x6D2B79F5)>>>0;
+      let value=state;
+      value=Math.imul(value^(value>>>15),value|1);
+      value^=value+Math.imul(value^(value>>>7),value|61);
+      return ((value^(value>>>14))>>>0)/4294967296;
+    };
+  }
+
+  function levelMazeSeed(currentLevel,attempt=0){
+    return (
+      mazeRunSeed^
+      Math.imul(currentLevel+1,0x9E3779B1)^
+      Math.imul(attempt+1,0x85EBCA6B)
+    )>>>0;
+  }
+
+  function mazeColorThemeForLevel(currentLevel){
+    const stage=Math.max(1,currentLevel);
+    if(stage===1) return MAZE_COLOR_THEMES[0];
+
+    // Levels two and three introduce two different non-green palettes.
+    const secondRandom=seededMazeRandom(levelMazeSeed(2,733));
+    const secondIndex=1+Math.floor(
+      secondRandom()*(MAZE_COLOR_THEMES.length-1)
+    );
+    if(stage===2) return MAZE_COLOR_THEMES[secondIndex];
+
+    const thirdRandom=seededMazeRandom(levelMazeSeed(3,733));
+    let thirdIndex=1+Math.floor(
+      thirdRandom()*(MAZE_COLOR_THEMES.length-1)
+    );
+    if(thirdIndex===secondIndex){
+      thirdIndex=1+(thirdIndex%(MAZE_COLOR_THEMES.length-1));
+    }
+    if(stage===3) return MAZE_COLOR_THEMES[thirdIndex];
+
+    // From level four onward every level makes a completely independent
+    // choice from the full palette. Green and immediate repeats are allowed.
+    const random=seededMazeRandom(levelMazeSeed(stage,733));
+    return MAZE_COLOR_THEMES[
+      Math.floor(random()*MAZE_COLOR_THEMES.length)
+    ];
+  }
+
+  function mazeFloorIsConnected(grid){
+    const start=PLAYER_STARTS[0];
+    if(grid[start.y][start.x]!=='.') return false;
+    const seen=new Uint8Array(COLS*ROWS);
+    const queue=[{x:start.x,y:start.y}];
+    seen[start.y*COLS+start.x]=1;
+    let read=0,visited=0,total=0;
+    for(let y=0;y<ROWS;y++){
+      for(let x=0;x<COLS;x++) if(grid[y][x]==='.') total++;
+    }
+    while(read<queue.length){
+      const cell=queue[read++];
+      visited++;
+      for(const direction of [
+        {x:1,y:0},{x:-1,y:0},{x:0,y:1},{x:0,y:-1}
+      ]){
+        const x=cell.x+direction.x,y=cell.y+direction.y;
+        if(x<0||y<0||x>=COLS||y>=ROWS||grid[y][x]!=='.') continue;
+        const index=y*COLS+x;
+        if(seen[index]) continue;
+        seen[index]=1;
+        queue.push({x,y});
+      }
+    }
+    // Dense tunnel-first maps intentionally use much less open floor than the
+    // older obstacle-in-an-open-room generator.
+    return visited===total&&total>=COLS*ROWS*0.32;
+  }
+
+  function generateOpenMazeCandidate(currentLevel){
+    const stage=Math.max(1,currentLevel);
+    const difficulty=Math.min(1,(stage-1)/8);
+
+    for(let attempt=0;attempt<48;attempt++){
+      const random=seededMazeRandom(levelMazeSeed(stage,attempt));
+      const grid=Array.from({length:ROWS},(_,y)=>
+        Array.from({length:COLS},(_,x)=>
+          x===0||y===0||x===COLS-1||y===ROWS-1?'#':'.'
+        )
+      );
+
+      const inside=(x,y)=>x>0&&y>0&&x<COLS-1&&y<ROWS-1;
+      const wall=(x,y)=>{
+        const mirrorX=COLS-1-x,mirrorY=ROWS-1-y;
+        if(inside(x,y)) grid[y][x]='#';
+        if(inside(mirrorX,mirrorY)) grid[mirrorY][mirrorX]='#';
+      };
+      const floor=(x,y)=>{
+        const mirrorX=COLS-1-x,mirrorY=ROWS-1-y;
+        if(inside(x,y)) grid[y][x]='.';
+        if(inside(mirrorX,mirrorY)) grid[mirrorY][mirrorX]='.';
+      };
+      const integer=(minimum,maximum)=>
+        minimum+Math.floor(random()*(maximum-minimum+1));
+
+      // Early levels are composed almost entirely of branches attached to the
+      // outer wall. They create readable turns and dead ends, but no isolated
+      // dots or small double corridors around which a snake can orbit.
+      const branchPairs=4+Math.floor(difficulty*3);
+      for(let i=0;i<branchPairs;i++){
+        const vertical=i%2===0;
+        const length=4+Math.floor(difficulty*3)+integer(0,2);
+        if(vertical){
+          const x=integer(5,COLS-6);
+          for(let y=1;y<=Math.min(ROWS/2-3,length);y++) wall(x,y);
+          if(stage>=3&&random()<0.34+difficulty*0.30){
+            const direction=random()<0.5?-1:1;
+            const endY=Math.min(ROWS/2-3,length);
+            for(let step=1;step<=1+Math.floor(difficulty*3);step++)
+              wall(x+direction*step,endY);
+          }
+        }else{
+          const y=integer(4,ROWS-5);
+          for(let x=1;x<=Math.min(COLS/2-4,length+1);x++) wall(x,y);
+          if(stage>=3&&random()<0.34+difficulty*0.30){
+            const direction=random()<0.5?-1:1;
+            const endX=Math.min(COLS/2-4,length+1);
+            for(let step=1;step<=1+Math.floor(difficulty*2);step++)
+              wall(endX,y+direction*step);
+          }
+        }
+      }
+
+      // Detached bars begin gently. Each one introduces a second route around
+      // an obstacle; their number and length increase with the level.
+      const internalPairs=stage<=2?0:Math.min(9,Math.floor((stage-2)*1.15));
+      for(let i=0;i<internalPairs;i++){
+        const horizontal=random()<0.5;
+        const length=2+Math.floor(difficulty*4)+integer(0,1);
+        const x=integer(4,COLS-5),y=integer(4,ROWS-5);
+        for(let step=0;step<length;step++){
+          wall(x+(horizontal?step:0),y+(horizontal?0:step));
+        }
+      }
+
+      // Parallel bars create the more dangerous double passages, deliberately
+      // absent on the first levels and increasingly common from level four.
+      const doublePassagePairs=stage<4?0:Math.min(4,1+Math.floor((stage-4)/2));
+      for(let i=0;i<doublePassagePairs;i++){
+        const horizontal=random()<0.5;
+        const length=3+integer(0,2)+Math.floor(difficulty*2);
+        const x=integer(5,COLS-8),y=integer(5,ROWS-8);
+        for(let step=0;step<length;step++){
+          wall(x+(horizontal?step:0),y+(horizontal?0:step));
+          wall(x+(horizontal?step:2),y+(horizontal?2:step));
+        }
+      }
+
+      // Isolated point chains are a late-game feature. The gap between points
+      // keeps each one as its own snakeBorderO tile and creates orbit choices.
+      const pointRuns=stage<5?0:Math.min(4,1+Math.floor((stage-5)/2));
+      for(let run=0;run<pointRuns;run++){
+        const horizontal=random()<0.5;
+        const count=2+Math.floor(difficulty*4)+integer(0,1);
+        const x=integer(4,COLS-10),y=integer(4,ROWS-10);
+        for(let point=0;point<count;point++){
+          wall(x+(horizontal?point*2:0),y+(horizontal?0:point*2));
+        }
+      }
+
+      // From level six onward, selected regions are deliberately cleared into
+      // wider arenas. By level nine there is a central arena and a symmetric
+      // pair of open zones, surrounded by the denser late-level structure.
+      if(stage>=6){
+        const radius=stage>=9?2:1;
+        for(let y=Math.floor(ROWS/2)-radius;y<=Math.ceil(ROWS/2)+radius-1;y++){
+          for(let x=Math.floor(COLS/2)-radius;x<=Math.ceil(COLS/2)+radius-1;x++)
+            floor(x,y);
+        }
+      }
+      if(stage>=8){
+        const arenaX=integer(7,11),arenaY=integer(6,9);
+        const arenaRadius=stage>=9?2:1;
+        for(let dy=-arenaRadius;dy<=arenaRadius;dy++){
+          for(let dx=-arenaRadius;dx<=arenaRadius;dx++)
+            floor(arenaX+dx,arenaY+dy);
+        }
+      }
+
+      // Both starting corners always have a clean 3x3 arrival area.
+      for(let y=1;y<=3;y++){
+        for(let x=1;x<=3;x++) floor(x,y);
+      }
+
+      // If two independently generated structures happen to close a passage,
+      // join the disconnected floor component to the nearest reachable tile.
+      // Carving is mirrored, so accessibility is repaired without sacrificing
+      // the two-player rotational symmetry.
+      for(let repair=0;repair<24&&!mazeFloorIsConnected(grid);repair++){
+        const seen=new Uint8Array(COLS*ROWS);
+        const queue=[{...PLAYER_STARTS[0]}];
+        seen[PLAYER_STARTS[0].y*COLS+PLAYER_STARTS[0].x]=1;
+        let read=0;
+        while(read<queue.length){
+          const cell=queue[read++];
+          for(const direction of [
+            {x:1,y:0},{x:-1,y:0},{x:0,y:1},{x:0,y:-1}
+          ]){
+            const x=cell.x+direction.x,y=cell.y+direction.y;
+            if(!inside(x,y)||grid[y][x]!=='.') continue;
+            const index=y*COLS+x;
+            if(seen[index]) continue;
+            seen[index]=1;
+            queue.push({x,y});
+          }
+        }
+
+        let orphan=null;
+        for(let y=1;y<ROWS-1&&!orphan;y++){
+          for(let x=1;x<COLS-1;x++){
+            if(grid[y][x]==='.'&&!seen[y*COLS+x]){
+              orphan={x,y};
+              break;
+            }
+          }
+        }
+        if(!orphan) break;
+
+        let nearest=null,nearestDistance=Infinity;
+        for(let y=1;y<ROWS-1;y++){
+          for(let x=1;x<COLS-1;x++){
+            if(!seen[y*COLS+x]) continue;
+            const distance=Math.abs(x-orphan.x)+Math.abs(y-orphan.y);
+            if(distance<nearestDistance){
+              nearest={x,y};
+              nearestDistance=distance;
+            }
+          }
+        }
+        if(!nearest) break;
+
+        let x=orphan.x,y=orphan.y;
+        const horizontalFirst=random()<0.5;
+        const carveHorizontal=()=>{
+          while(x!==nearest.x){
+            floor(x,y);
+            x+=Math.sign(nearest.x-x);
+          }
+          floor(x,y);
+        };
+        const carveVertical=()=>{
+          while(y!==nearest.y){
+            floor(x,y);
+            y+=Math.sign(nearest.y-y);
+          }
+          floor(x,y);
+        };
+        if(horizontalFirst){ carveHorizontal(); carveVertical(); }
+        else{ carveVertical(); carveHorizontal(); }
+      }
+
+      // Level nine and beyond always contain a recognizable point gallery in
+      // two symmetric open zones. Clearing a three-cell-high lane first keeps
+      // every dot isolated and every route around it accessible.
+      if(stage>=9){
+        const galleryY=6+(stage%2);
+        const galleryStartX=8+(stage%2);
+        const galleryCount=5;
+        const galleryEndX=galleryStartX+(galleryCount-1)*2;
+        for(let y=galleryY-1;y<=galleryY+1;y++){
+          for(let x=galleryStartX-1;x<=galleryEndX+1;x++) floor(x,y);
+        }
+        for(let point=0;point<galleryCount;point++){
+          wall(galleryStartX+point*2,galleryY);
+        }
+      }
+
+      // Guarantee recognizable late-game point sequences after connectivity
+      // repair. Each candidate chain is accepted only if every point stays
+      // isolated, all floor remains connected and the mirrored chain also fits.
+      const accentRuns=stage>=9?2:stage>=7?1:0;
+      for(let run=0;run<accentRuns;run++){
+        for(let placement=0;placement<80;placement++){
+          const horizontal=random()<0.5;
+          const count=stage>=9?4+integer(0,1):3;
+          const maximumX=horizontal?COLS-3-(count-1)*2:COLS-4;
+          const maximumY=horizontal?ROWS-4:ROWS-3-(count-1)*2;
+          const startX=integer(3,Math.max(3,maximumX));
+          const startY=integer(3,Math.max(3,maximumY));
+          const cells=new Map();
+          for(let point=0;point<count;point++){
+            const x=startX+(horizontal?point*2:0);
+            const y=startY+(horizontal?0:point*2);
+            cells.set(`${x},${y}`,{x,y});
+            const mirrorX=COLS-1-x,mirrorY=ROWS-1-y;
+            cells.set(`${mirrorX},${mirrorY}`,{x:mirrorX,y:mirrorY});
+          }
+          const candidates=[...cells.values()];
+          const fits=candidates.every(cell=>
+            inside(cell.x,cell.y)&&grid[cell.y][cell.x]==='.'&&
+            [
+              {x:1,y:0},{x:-1,y:0},{x:0,y:1},{x:0,y:-1}
+            ].every(direction=>
+              grid[cell.y+direction.y][cell.x+direction.x]==='.'&&
+              !cells.has(`${cell.x+direction.x},${cell.y+direction.y}`)
+            )
+          );
+          if(!fits) continue;
+          candidates.forEach(cell=>{ grid[cell.y][cell.x]='#'; });
+          if(mazeFloorIsConnected(grid)) break;
+          candidates.forEach(cell=>{ grid[cell.y][cell.x]='.'; });
+        }
+      }
+
+      if(mazeFloorIsConnected(grid)){
+        return grid.map(row=>row.join(''));
+      }
+    }
+
+    // A conservative fallback should a very dense random combination fail all
+    // connectivity attempts. It is still fully playable and symmetric.
+    return [...CLASSIC_MAZE];
+  }
+
+  function generateMazeForLevel(currentLevel){
+    const stage=Math.max(1,currentLevel);
+    const difficulty=Math.min(1,(stage-1)/8);
+    const random=seededMazeRandom(levelMazeSeed(stage,91));
+    const symmetryStyles=['rotational','left-right','top-bottom','four-way','asymmetric'];
+    // Every level independently selects its large-scale structure. The level
+    // seed keeps the selection stable during play, but a new game can begin
+    // with any symmetry instead of always following the same fixed sequence.
+    const styleOffset=Math.floor(random()*symmetryStyles.length);
+    const symmetryStyle=symmetryStyles[styleOffset];
+    const integer=(minimum,maximum)=>
+      minimum+Math.floor(random()*(maximum-minimum+1));
+    const grid=Array.from({length:ROWS},()=>Array(COLS).fill('#'));
+    const inside=(x,y)=>x>0&&y>0&&x<COLS-1&&y<ROWS-1;
+    const mirrorOf=(x,y)=>({x:COLS-1-x,y:ROWS-1-y});
+    const openRaw=(x,y)=>{ if(inside(x,y)) grid[y][x]='.'; };
+    const wallRaw=(x,y)=>{ if(inside(x,y)) grid[y][x]='#'; };
+    const openPair=(x,y)=>{
+      openRaw(x,y);
+      const mirror=mirrorOf(x,y);
+      openRaw(mirror.x,mirror.y);
+    };
+    const wallPair=(x,y)=>{
+      wallRaw(x,y);
+      const mirror=mirrorOf(x,y);
+      wallRaw(mirror.x,mirror.y);
+    };
+    const featureCopies=(x,y)=>{
+      const copies=[{x,y}];
+      if(symmetryStyle==='rotational') copies.push(mirrorOf(x,y));
+      else if(symmetryStyle==='left-right') copies.push({x:COLS-1-x,y});
+      else if(symmetryStyle==='top-bottom') copies.push({x,y:ROWS-1-y});
+      else if(symmetryStyle==='four-way'){
+        copies.push(
+          {x:COLS-1-x,y},
+          {x,y:ROWS-1-y},
+          mirrorOf(x,y)
+        );
+      }
+      const unique=new Map();
+      copies.forEach(cell=>{
+        if(inside(cell.x,cell.y)) unique.set(`${cell.x},${cell.y}`,cell);
+      });
+      return [...unique.values()];
+    };
+    const openFeature=(x,y)=>featureCopies(x,y).forEach(cell=>openRaw(cell.x,cell.y));
+    const wallFeature=(x,y)=>featureCopies(x,y).forEach(cell=>wallRaw(cell.x,cell.y));
+    const reservedFeatureCells=new Set();
+    const claimFeatureZone=(x,y,width,height,margin=1)=>{
+      const expanded=[];
+      for(let dy=-margin;dy<height+margin;dy++){
+        for(let dx=-margin;dx<width+margin;dx++){
+          featureCopies(x+dx,y+dy).forEach(cell=>
+            expanded.push(`${cell.x},${cell.y}`)
+          );
+        }
+      }
+      if(expanded.some(key=>reservedFeatureCells.has(key))) return false;
+      expanded.forEach(key=>reservedFeatureCells.add(key));
+      return true;
+    };
+    const featureZoneY=height=>{
+      if(symmetryStyle==='top-bottom'||symmetryStyle==='four-way'){
+        return integer(4,Math.max(4,Math.floor(ROWS/2)-height-1));
+      }
+      return integer(4,Math.max(4,ROWS-5-height));
+    };
+
+    // Build a perfect one-cell-wide maze in the left half. Mirroring the
+    // carved half produces an equally difficult territory for Player 2.
+    const logicalColumns=7;
+    const logicalRows=11;
+    const visited=new Uint8Array(logicalColumns*logicalRows);
+    const stack=[{x:0,y:0}];
+    visited[0]=1;
+    openRaw(1,1);
+    while(stack.length){
+      const current=stack[stack.length-1];
+      const choices=[];
+      for(const direction of [
+        {x:1,y:0},{x:-1,y:0},{x:0,y:1},{x:0,y:-1}
+      ]){
+        const x=current.x+direction.x,y=current.y+direction.y;
+        if(x<0||y<0||x>=logicalColumns||y>=logicalRows) continue;
+        if(!visited[y*logicalColumns+x]) choices.push({x,y});
+      }
+      if(!choices.length){
+        stack.pop();
+        continue;
+      }
+      const next=choices[(random()*choices.length)|0];
+      const currentGrid={x:1+current.x*2,y:1+current.y*2};
+      const nextGrid={x:1+next.x*2,y:1+next.y*2};
+      openRaw((currentGrid.x+nextGrid.x)/2,(currentGrid.y+nextGrid.y)/2);
+      openRaw(nextGrid.x,nextGrid.y);
+      visited[next.y*logicalColumns+next.x]=1;
+      stack.push(next);
+    }
+
+    // Copy every left-side tunnel through the centre of the board. The two
+    // halves use opposite pixel parity, preserving exact 180-degree symmetry
+    // without turning the whole board into a double-width corridor field.
+    const leftSnapshot=grid.map(row=>row.slice());
+    for(let y=1;y<ROWS-1;y++){
+      for(let x=1;x<=13;x++){
+        if(leftSnapshot[y][x]==='.'){
+          const mirror=mirrorOf(x,y);
+          openRaw(mirror.x,mirror.y);
+        }
+      }
+    }
+
+    // Two distant, mirrored zig-zag bridges connect the halves. They provide
+    // global access without the dangerous central 2x2 room of the old map.
+    const bridgeY=5+integer(0,2)*2;
+    for(let x=13;x<=18;x++) openPair(x,bridgeY);
+    openPair(18,bridgeY+1);
+
+    const extraBridgeCount=symmetryStyle==='rotational'
+      ? 0
+      : symmetryStyle==='four-way'
+        ? 2
+        : 1;
+    const extraBridgeRows=[3,11,19];
+    for(let bridge=0;bridge<extraBridgeCount;bridge++){
+      const y=extraBridgeRows[(bridge+styleOffset)%extraBridgeRows.length];
+      if(symmetryStyle==='asymmetric'){
+        for(let x=13;x<=18;x++) openRaw(x,y);
+        openRaw(18,y+1);
+      }else{
+        for(let x=13;x<=18;x++) openPair(x,y);
+        openPair(18,y+1);
+      }
+    }
+
+    // Change the large-scale structural symmetry, not merely the decorative
+    // rooms. The asymmetric mode deliberately keeps the rotational base and
+    // lets its later one-sided features break the resemblance.
+    const structuralSnapshot=grid.map(row=>row.slice());
+    if(symmetryStyle==='left-right'){
+      for(let y=1;y<ROWS-1;y++){
+        for(let x=1;x<COLS/2;x++)
+          grid[y][COLS-1-x]=structuralSnapshot[y][x];
+      }
+    }else if(symmetryStyle==='top-bottom'){
+      for(let y=1;y<ROWS/2;y++){
+        for(let x=1;x<COLS-1;x++)
+          grid[ROWS-1-y][x]=structuralSnapshot[y][x];
+      }
+    }else if(symmetryStyle==='four-way'){
+      for(let y=1;y<ROWS/2;y++){
+        for(let x=1;x<COLS/2;x++){
+          const value=structuralSnapshot[y][x];
+          grid[y][x]=value;
+          grid[y][COLS-1-x]=value;
+          grid[ROWS-1-y][x]=value;
+          grid[ROWS-1-y][COLS-1-x]=value;
+        }
+      }
+    }
+
+    // Each spawn is a narrow L-shaped junction with two independent exits.
+    // It provides an immediate escape choice without creating a 2x2 room.
+    const p1Safe=[
+      {x:1,y:1},{x:2,y:1},{x:3,y:1},
+      {x:1,y:2},{x:1,y:3}
+    ];
+    const p2Safe=[
+      {x:COLS-2,y:ROWS-2},{x:COLS-3,y:ROWS-2},{x:COLS-4,y:ROWS-2},
+      {x:COLS-2,y:ROWS-3},{x:COLS-2,y:ROWS-4}
+    ];
+    const p3Safe=[
+      {x:1,y:ROWS-2},{x:2,y:ROWS-2},{x:3,y:ROWS-2},
+      {x:1,y:ROWS-3},{x:1,y:ROWS-4}
+    ];
+    [...p1Safe,...p2Safe,...p3Safe].forEach(cell=>openRaw(cell.x,cell.y));
+    // Protect the five deliberately opened cells at each start. Neighbouring
+    // random tunnels may still be narrowed by the final room-size guard, so
+    // they cannot merge with the spawn pocket into an accidental 2x4 hall.
+    const protectedStartCells=new Set(
+      [...p1Safe,...p2Safe,...p3Safe].map(cell=>`${cell.x},${cell.y}`)
+    );
+
+    // Some four-way and horizontal reflections can cut a pre-existing route.
+    // Reconnect any orphaned tunnel with a narrow style-aware corridor.
+    for(let repair=0;repair<20&&!mazeFloorIsConnected(grid);repair++){
+      const seen=new Uint8Array(COLS*ROWS);
+      const queue=[{...PLAYER_STARTS[0]}];
+      seen[PLAYER_STARTS[0].y*COLS+PLAYER_STARTS[0].x]=1;
+      let read=0;
+      while(read<queue.length){
+        const cell=queue[read++];
+        for(const direction of [
+          {x:1,y:0},{x:-1,y:0},{x:0,y:1},{x:0,y:-1}
+        ]){
+          const x=cell.x+direction.x,y=cell.y+direction.y;
+          if(!inside(x,y)||grid[y][x]!=='.') continue;
+          const index=y*COLS+x;
+          if(seen[index]) continue;
+          seen[index]=1;
+          queue.push({x,y});
+        }
+      }
+      let orphan=null;
+      for(let y=1;y<ROWS-1&&!orphan;y++){
+        for(let x=1;x<COLS-1;x++){
+          if(grid[y][x]==='.'&&!seen[y*COLS+x]){
+            orphan={x,y};
+            break;
+          }
+        }
+      }
+      if(!orphan) break;
+      let nearest=null,nearestDistance=Infinity;
+      for(let y=1;y<ROWS-1;y++){
+        for(let x=1;x<COLS-1;x++){
+          if(!seen[y*COLS+x]) continue;
+          const distance=Math.abs(x-orphan.x)+Math.abs(y-orphan.y);
+          if(distance<nearestDistance){
+            nearest={x,y};
+            nearestDistance=distance;
+          }
+        }
+      }
+      if(!nearest) break;
+      let x=orphan.x,y=orphan.y;
+      const carveHorizontal=()=>{
+        while(x!==nearest.x){
+          openFeature(x,y);
+          x+=Math.sign(nearest.x-x);
+        }
+        openFeature(x,y);
+      };
+      const carveVertical=()=>{
+        while(y!==nearest.y){
+          openFeature(x,y);
+          y+=Math.sign(nearest.y-y);
+        }
+        openFeature(x,y);
+      };
+      if(random()<0.5){ carveHorizontal(); carveVertical(); }
+      else{ carveVertical(); carveHorizontal(); }
+    }
+
+    const plannedPairCells=(x,y)=>{
+      const mirror=mirrorOf(x,y);
+      const map=new Map();
+      if(inside(x,y)) map.set(`${x},${y}`,{x,y});
+      if(inside(mirror.x,mirror.y))
+        map.set(`${mirror.x},${mirror.y}`,mirror);
+      return [...map.values()];
+    };
+    const plannedFeatureCells=(x,y)=>featureCopies(x,y);
+    const featureCreatesTwoByTwo=(x,y)=>{
+      const planned=plannedFeatureCells(x,y);
+      const plannedKeys=new Set(planned.map(cell=>`${cell.x},${cell.y}`));
+      const willBeFloor=(floorX,floorY)=>
+        inside(floorX,floorY)&&
+        (grid[floorY][floorX]==='.'||plannedKeys.has(`${floorX},${floorY}`));
+      return planned.some(cell=>{
+        for(const offsetY of [-1,0]){
+          for(const offsetX of [-1,0]){
+            let allFloor=true;
+            for(let dy=0;dy<2;dy++){
+              for(let dx=0;dx<2;dx++){
+                if(!willBeFloor(cell.x+offsetX+dx,cell.y+offsetY+dy))
+                  allFloor=false;
+              }
+            }
+            if(allFloor) return true;
+          }
+        }
+        return false;
+      });
+    };
+
+    // Levels two and three gain only narrow shortcuts. They introduce route
+    // choice while still forbidding two-cell-wide open patches.
+    const shortcutPairs=Math.min(14,Math.max(0,stage-1)*2);
+    const candidates=[];
+    for(let y=1;y<ROWS-1;y++){
+      for(let x=1;x<COLS-1;x++){
+        if(grid[y][x]!== '#') continue;
+        const horizontal=grid[y][x-1]==='.'&&grid[y][x+1]==='.';
+        const vertical=grid[y-1][x]==='.'&&grid[y+1][x]==='.';
+        if(horizontal||vertical) candidates.push({x,y});
+      }
+    }
+    for(let i=candidates.length-1;i>0;i--){
+      const swap=(random()*(i+1))|0;
+      [candidates[i],candidates[swap]]=[candidates[swap],candidates[i]];
+    }
+    let shortcuts=0;
+    for(const candidate of candidates){
+      if(shortcuts>=shortcutPairs) break;
+      if(stage<4&&featureCreatesTwoByTwo(candidate.x,candidate.y)) continue;
+      openFeature(candidate.x,candidate.y);
+      shortcuts++;
+    }
+
+    // From level four onward, a small number of deliberate double passages
+    // appear. They become longer and more numerous only on later levels.
+    const doublePassagePairs=stage<4?0:Math.min(3,1+Math.floor((stage-4)/3));
+    for(let passage=0;passage<doublePassagePairs;passage++){
+      for(let placement=0;placement<40;placement++){
+        const horizontal=random()<0.5;
+        const width=horizontal?3:2;
+        const height=horizontal?2:3;
+        const startX=integer(4,11);
+        const startY=featureZoneY(height);
+        if(!claimFeatureZone(startX,startY,width,height,1)) continue;
+        for(let dy=0;dy<height;dy++){
+          for(let dx=0;dx<width;dx++)
+            openFeature(startX+dx,startY+dy);
+        }
+        break;
+      }
+    }
+
+    // Before points become an intentional feature, remove any accidental
+    // isolated wall created by a bridge or shortcut. Prefer attaching it to a
+    // neighbouring wall; accept the change only while all tunnels stay open.
+    if(stage<5){
+      for(let pass=0;pass<24;pass++){
+        let isolated=null;
+        for(let y=1;y<ROWS-1&&!isolated;y++){
+          for(let x=1;x<COLS-1;x++){
+            if(grid[y][x]!=='#') continue;
+            const hasWallNeighbour=[
+              {x:1,y:0},{x:-1,y:0},{x:0,y:1},{x:0,y:-1}
+            ].some(direction=>grid[y+direction.y][x+direction.x]==='#');
+            if(!hasWallNeighbour){ isolated={x,y}; break; }
+          }
+        }
+        if(!isolated) break;
+
+        const directions=[
+          {x:1,y:0},{x:-1,y:0},{x:0,y:1},{x:0,y:-1}
+        ];
+        for(let i=directions.length-1;i>0;i--){
+          const swap=(random()*(i+1))|0;
+          [directions[i],directions[swap]]=[directions[swap],directions[i]];
+        }
+        let attached=false;
+        for(const direction of directions){
+          const x=isolated.x+direction.x,y=isolated.y+direction.y;
+          if(protectedStartCells.has(`${x},${y}`)) continue;
+          if(grid[y][x]!=='.') continue;
+          const changed=plannedPairCells(x,y).map(cell=>({
+            ...cell,
+            previous:grid[cell.y][cell.x]
+          }));
+          wallPair(x,y);
+          if(mazeFloorIsConnected(grid)){
+            attached=true;
+            break;
+          }
+          changed.forEach(cell=>{ grid[cell.y][cell.x]=cell.previous; });
+        }
+        // This is a rare safety fallback. Removing the point cannot disconnect
+        // anything and is still preferable to an early orbit obstacle.
+        if(!attached) openPair(isolated.x,isolated.y);
+      }
+    }
+
+    // Points are introduced later by opening a safe ring and retaining its
+    // centre wall. They can be orbited, but never block access to a tunnel.
+    const pointPairs=stage<5?0:Math.min(3,1+Math.floor((stage-5)/2));
+    for(let point=0;point<pointPairs;point++){
+      for(let placement=0;placement<60;placement++){
+        const centreX=integer(5,11),startY=featureZoneY(3);
+        const centreY=startY+1;
+        if(!claimFeatureZone(centreX-1,startY,3,3,1)) continue;
+        for(let dy=-1;dy<=1;dy++){
+          for(let dx=-1;dx<=1;dx++) openFeature(centreX+dx,centreY+dy);
+        }
+        wallFeature(centreX,centreY);
+        break;
+      }
+    }
+
+    // Open rooms remain a difficulty feature, but every deliberately cleared
+    // room is capped at 3x3 so that a snake can still be approached and eaten.
+    if(stage>=6){
+      const arenaPairs=Math.min(2,1+Math.floor((stage-6)/4));
+      for(let arena=0;arena<arenaPairs;arena++){
+        for(let placement=0;placement<60;placement++){
+          const startX=integer(4,10),startY=featureZoneY(3);
+          if(!claimFeatureZone(startX,startY,3,3,1)) continue;
+          for(let dy=0;dy<3;dy++){
+            for(let dx=0;dx<3;dx++) openFeature(startX+dx,startY+dy);
+          }
+          break;
+        }
+      }
+    }
+
+    // Late levels keep the popular orbit points, but use separate 3x3 pockets
+    // instead of one almost unplayable open gallery.
+    if(stage>=9){
+      for(let pocket=0;pocket<2;pocket++){
+        for(let placement=0;placement<80;placement++){
+          const centreX=integer(5,11),startY=featureZoneY(3);
+          const centreY=startY+1;
+          if(!claimFeatureZone(centreX-1,startY,3,3,1)) continue;
+          for(let dy=-1;dy<=1;dy++){
+            for(let dx=-1;dx<=1;dx++) openFeature(centreX+dx,centreY+dy);
+          }
+          wallFeature(centreX,centreY);
+          break;
+        }
+      }
+    }
+
+    // Keep the inside corner beside each spawn closed even if a later
+    // shortcut candidate selected it. The two narrow exits remain available,
+    // but the starting junction can never expand into an open 2x2 pocket.
+    wallRaw(2,2);
+    wallRaw(COLS-3,ROWS-3);
+    wallRaw(2,ROWS-3);
+
+    // Final gameplay guard: a special room may be at most 3x3, and a
+    // double-width passage may be at most three cells long. Long one-cell-wide
+    // tunnels remain untouched. Small limiter walls are accepted only when
+    // they preserve access to every floor tile.
+    const findOversizedOpening=()=>{
+      for(const shape of [{width:4,height:2},{width:2,height:4}]){
+        for(let y=1;y<=ROWS-1-shape.height;y++){
+          for(let x=1;x<=COLS-1-shape.width;x++){
+            let open=true;
+            for(let dy=0;dy<shape.height&&open;dy++){
+              for(let dx=0;dx<shape.width;dx++){
+                if(grid[y+dy][x+dx]!=='.'){
+                  open=false;
+                  break;
+                }
+              }
+            }
+            if(open) return {x,y,...shape};
+          }
+        }
+      }
+      return null;
+    };
+    for(let limiter=0;limiter<320;limiter++){
+      const opening=findOversizedOpening();
+      if(!opening) break;
+      const candidates=[];
+      for(let dy=0;dy<opening.height;dy++){
+        for(let dx=0;dx<opening.width;dx++){
+          candidates.push({x:opening.x+dx,y:opening.y+dy});
+        }
+      }
+      candidates.sort((a,b)=>{
+        const centreX=opening.x+(opening.width-1)/2;
+        const centreY=opening.y+(opening.height-1)/2;
+        return (Math.abs(a.x-centreX)+Math.abs(a.y-centreY))-
+          (Math.abs(b.x-centreX)+Math.abs(b.y-centreY));
+      });
+      let limited=false;
+      for(const candidate of candidates){
+        const copies=featureCopies(candidate.x,candidate.y);
+        if(copies.some(cell=>protectedStartCells.has(`${cell.x},${cell.y}`))) continue;
+        const changed=copies.map(cell=>({
+          ...cell,
+          previous:grid[cell.y][cell.x]
+        }));
+        wallFeature(candidate.x,candidate.y);
+        if(mazeFloorIsConnected(grid)){
+          limited=true;
+          break;
+        }
+        changed.forEach(cell=>{ grid[cell.y][cell.x]=cell.previous; });
+      }
+      if(limited) continue;
+
+      // Gameplay safety takes precedence over exact decoration symmetry.
+      for(const candidate of candidates){
+        if(protectedStartCells.has(`${candidate.x},${candidate.y}`)) continue;
+        wallRaw(candidate.x,candidate.y);
+        if(mazeFloorIsConnected(grid)){
+          limited=true;
+          break;
+        }
+        openRaw(candidate.x,candidate.y);
+      }
+      if(!limited) break;
+    }
+
+    return mazeFloorIsConnected(grid)
+      ? grid.map(row=>row.join(''))
+      : [...CLASSIC_MAZE];
+  }
+
+  function applyMazeForLevel(currentLevel){
+    maze=generateMazeForLevel(currentLevel);
+    mazeColorTheme=mazeColorThemeForLevel(currentLevel);
+    mazeRevision++;
+  }
   const PLAYER_SLIDE_RATIO=0.55;
   const SCORPION_SLIDE_RATIO=0.275;
   const HUNTER_SLIDE_RATIO=0.55;
@@ -288,10 +1157,10 @@
   const SNAKE_TAIL_LEAD_RATIO=0.5;
   const PREDICTIVE_SLIDE_SPEED_MULTIPLIER=2;
 
-  // Every inhabitant, including the player, follows the same endlessly rising
-  // level-speed curve. There is deliberately no late-level speed plateau.
+  // Movement timing now remains constant across all levels. Difficulty grows
+  // through maze structure, population, intelligence and encounter pressure.
   function levelSpeedMultiplier(){
-    return 1+Math.max(0,level-1)*0.09;
+    return 1;
   }
   function snakeMoveDelay(){
     return 218/levelSpeedMultiplier();
@@ -299,28 +1168,59 @@
   function hunterMoveDelay(){
     return 95/levelSpeedMultiplier();
   }
-  function playerMoveDelay(t=performance.now()){
+  function playerMoveDelay(p,t=performance.now()){
     const normal=95/levelSpeedMultiplier();
-    return isPowerMode(t) ? normal*0.5 : normal;
+    return isPowerMode(p,t) ? normal*0.5 : normal;
   }
 
-  let player, snakes, score, lives, gameOver, paused, level, tickCount;
+  let player, player2, player3, snakes, gameOver, paused, level, tickCount;
+  let activePlayerCount=1;
+  let humanPlayerCount=1;
+  let alliedAiPlayerId=0;
+  let gameMode=1;
+  let awaitingPlayerSelection=true;
   let levelStartingSnakeMass=1;
-  let powerModeUntil=0;
-  let powerFlashBright=false;
-  let lastPowerFlashAt=0;
-  let spawnShieldUntil=0;
-  let spawnFlashBright=false;
-  let lastSpawnFlashAt=0;
-  let nextExtraLifeScore=1000;
-  let extraLivesEarned=0;
   let scorpion, fruits, eggs, hunters, pendingScorpionDrops;
   let scorpionKilled=false;
   let levelStartedAt=0, scorpionSpawnAt=0;
   const keys = {};
-  let pointerNavigation=null;
-  let lastMove = 0, lastSnakeMove = 0;
-  let lastPlayerMouthAt=0;
+  let lastSnakeMove = 0;
+
+  function allPlayers(){
+    return [player,player2,player3].slice(0,activePlayerCount).filter(Boolean);
+  }
+
+  function livingPlayers(){
+    return allPlayers().filter(p=>!p.dead&&p.lives>0);
+  }
+
+  function playerAt(x,y){
+    return livingPlayers().find(p=>p.x===x&&p.y===y)||null;
+  }
+
+  function humanPlayers(){
+    return allPlayers().filter(p=>!p.isAI);
+  }
+
+  function livingHumanPlayers(){
+    return humanPlayers().filter(p=>!p.dead&&p.lives>0);
+  }
+
+  function teammatesOf(p){
+    return allPlayers().filter(other=>other!==p);
+  }
+
+  function teammateAt(p,x,y){
+    return teammatesOf(p).find(other=>
+      !other.dead&&other.lives>0&&other.x===x&&other.y===y
+    )||null;
+  }
+
+  function setPlayerReference(p){
+    if(p.id===1) player=p;
+    else if(p.id===2) player2=p;
+    else player3=p;
+  }
 
   function isWall(x,y) {
     return x<0 || y<0 || x>=COLS || y>=ROWS || maze[y][x] === '#';
@@ -346,7 +1246,10 @@
     }
 
     function update(t=performance.now()){
-      const nextEpoch=`${player.x},${player.y}:${obstacleSignature(t)}`;
+      const positions=livingPlayers()
+        .map(p=>`${p.id}:${p.x},${p.y}`)
+        .join('|');
+      const nextEpoch=`${mazeRevision}:${positions}:${obstacleSignature(t)}`;
       if(nextEpoch!==epochKey){
         epochKey=nextEpoch;
         fields=new Map();
@@ -364,7 +1267,9 @@
         x:clamp(Math.round(target.x),0,COLS-1),
         y:clamp(Math.round(target.y),0,ROWS-1)
       };
-      const roundedIsPlayer=rounded.x===player.x&&rounded.y===player.y;
+      const roundedIsPlayer=livingPlayers().some(p=>
+        rounded.x===p.x&&rounded.y===p.y
+      );
       if(!isWall(rounded.x,rounded.y)&&
          (roundedIsPlayer||!occupiedBySolidEgg(rounded.x,rounded.y,t))){
         return rounded;
@@ -378,7 +1283,8 @@
           }
         }
       }
-      return {x:player.x,y:player.y};
+      const fallback=livingPlayers()[0]||PLAYER_STARTS[0];
+      return {x:fallback.x,y:fallback.y};
     }
 
     function buildField(target,t){
@@ -426,18 +1332,53 @@
           surpriseAt:t+9000+Math.random()*15000,
           lastChoice:null,
           brainId:nextBrainId++,
-          coordinationRole:null
+          coordinationRole:null,
+          targetPlayerId:null,
+          targetPlayerUntil:0
         };
       }
       return entity.brainState;
     }
 
-    function aggression(entity,profile,t){
+    function selectTargetPlayer(entity,state,t){
+      const candidates=livingPlayers();
+      if(!candidates.length) return allPlayers()[0]||null;
+      if(candidates.length===1) return candidates[0];
+
+      const current=candidates.find(p=>p.id===state.targetPlayerId);
+      if(current&&t<state.targetPlayerUntil) return current;
+
+      const weights=candidates.map(p=>{
+        const personal=(entity.threatByPlayer&&entity.threatByPlayer[p.id-1])||0;
+        const shared=Math.max(0,p.aggressionContribution||0);
+        const distance=Math.abs((entity.x??entity.body?.[0]?.x??0)-p.x)+
+          Math.abs((entity.y??entity.body?.[0]?.y??0)-p.y);
+        return 1+personal*1.8+shared*0.055+3/(2+distance);
+      });
+      const total=weights.reduce((sum,value)=>sum+value,0);
+      let roll=Math.random()*total;
+      let chosen=candidates[candidates.length-1];
+      for(let i=0;i<candidates.length;i++){
+        roll-=weights[i];
+        if(roll<=0){ chosen=candidates[i]; break; }
+      }
+      state.targetPlayerId=chosen.id;
+      state.targetPlayerUntil=t+1000+Math.random()*2400;
+      state.target=null;
+      state.planUntil=0;
+      return chosen;
+    }
+
+    function aggression(entity,profile,t,targetPlayer){
       const state=stateFor(entity,t);
       const slowWave=0.5+0.5*Math.sin(t/state.period+state.phase);
       const quickNuance=0.5+0.5*Math.sin(t/(state.period*0.43)+state.phase*1.71);
+      const personalThreat=targetPlayer&&entity.threatByPlayer
+        ? entity.threatByPlayer[targetPlayer.id-1]||0
+        : 0;
       const potential=clamp(
-        (profile.base||0)+(profile.injury||0)+(profile.stateBoost||0),
+        (profile.base||0)+(profile.injury||0)+(profile.stateBoost||0)+
+          Math.min(0.24,personalThreat*0.055),
         0.04,
         0.90
       );
@@ -475,7 +1416,7 @@
       return state.coordinationRole;
     }
 
-    function tacticalTarget(entity,origin,profile,attention,t){
+    function tacticalTarget(entity,origin,profile,attention,targetPlayer,t){
       const state=stateFor(entity,t);
       const intelligence=evolvingIntelligence(profile,t);
       const population=attackerPopulation();
@@ -485,21 +1426,21 @@
           Math.random()<intelligence*0.94;
 
         if(canCoordinate){
-          const playerDir=(player.dir.x||player.dir.y)
-            ? player.dir
+          const playerDir=(targetPlayer.dir.x||targetPlayer.dir.y)
+            ? targetPlayer.dir
             : {x:1,y:0};
           const side={x:-playerDir.y,y:playerDir.x};
           if(role===0){
-            state.target={x:player.x,y:player.y};
+            state.target={x:targetPlayer.x,y:targetPlayer.y};
             state.planType='coordinate-center';
           }else{
             const flankSign=role===1?-1:1;
             const sideDistance=2+Math.round(intelligence*3);
             const leadDistance=Math.round(intelligence*3);
             state.target=nearestRouteTile({
-              x:player.x+playerDir.x*leadDistance+
+              x:targetPlayer.x+playerDir.x*leadDistance+
                 side.x*sideDistance*flankSign,
-              y:player.y+playerDir.y*leadDistance+
+              y:targetPlayer.y+playerDir.y*leadDistance+
                 side.y*sideDistance*flankSign
             },t);
             state.planType=role===1?'coordinate-left':'coordinate-right';
@@ -515,21 +1456,21 @@
           const canAmbush=!preciseSolo&&attention>0.62&&
             Math.random()<(0.02+attention*0.08)*(1-intelligence*0.75);
           if(canAmbush){
-            const playerDir=(player.dir.x||player.dir.y)
-              ? player.dir
+            const playerDir=(targetPlayer.dir.x||targetPlayer.dir.y)
+              ? targetPlayer.dir
               : {x:1,y:0};
             const side={x:-playerDir.y,y:playerDir.x};
             const lead=2+((Math.random()*4)|0);
             const sideAmount=(Math.random()<0.5?-1:1)*
               (1+((Math.random()*3)|0));
             state.target=nearestRouteTile({
-              x:player.x+playerDir.x*lead+side.x*sideAmount,
-              y:player.y+playerDir.y*lead+side.y*sideAmount
+              x:targetPlayer.x+playerDir.x*lead+side.x*sideAmount,
+              y:targetPlayer.y+playerDir.y*lead+side.y*sideAmount
             },t);
             state.planType='ambush';
             state.planUntil=t+1600+Math.random()*2800;
           }else{
-            state.target={x:player.x,y:player.y};
+            state.target={x:targetPlayer.x,y:targetPlayer.y};
             state.planType='chase';
             state.planUntil=t+900+Math.random()*1900;
           }
@@ -540,7 +1481,7 @@
       // immediately fall back to the player's real position.
       const plannedField=fieldFor(state.target,t);
       if(plannedField[index(origin.x,origin.y)]<0){
-        state.target={x:player.x,y:player.y};
+        state.target={x:targetPlayer.x,y:targetPlayer.y};
         state.planType='chase';
         state.planUntil=t+900;
       }
@@ -552,7 +1493,9 @@
       if(options.length===1) return options[0];
 
       const state=stateFor(entity,t);
-      const attention=aggression(entity,profile,t);
+      const targetPlayer=selectTargetPlayer(entity,state,t);
+      if(!targetPlayer) return options[(Math.random()*options.length)|0];
+      const attention=aggression(entity,profile,t,targetPlayer);
       const intelligence=evolvingIntelligence(profile,t);
       entity.brainIntelligence=intelligence;
       const straight=options.find(d=>
@@ -578,8 +1521,8 @@
       // A fleeing creature uses the same shortest-path map in reverse: each
       // intelligent choice seeks the route tile farthest from the player.
       const target=fleeing
-        ? {x:player.x,y:player.y}
-        : tacticalTarget(entity,origin,profile,attention,t);
+        ? {x:targetPlayer.x,y:targetPlayer.y}
+        : tacticalTarget(entity,origin,profile,attention,targetPlayer,t);
       const field=fieldFor(target,t);
       const ranked=options.map(d=>{
         const nx=origin.x+d.x,ny=origin.y+d.y;
@@ -629,8 +1572,8 @@
           if(alternatives.length){
             choice=alternatives[(Math.random()*alternatives.length)|0];
             state.target=nearestRouteTile({
-              x:player.x+(Math.random()<0.5?1:-1)*(2+((Math.random()*4)|0)),
-              y:player.y+(Math.random()<0.5?1:-1)*(2+((Math.random()*4)|0))
+              x:targetPlayer.x+(Math.random()<0.5?1:-1)*(2+((Math.random()*4)|0)),
+              y:targetPlayer.y+(Math.random()<0.5?1:-1)*(2+((Math.random()*4)|0))
             },t);
             state.planType='flank';
             state.planUntil=t+1800+Math.random()*2600;
@@ -643,6 +1586,604 @@
     }
 
     return {update,choose,aggression};
+  })();
+
+  // Dedicated snake-hunter intelligence for the optional AI player. It keeps
+  // one persistent prey assignment, maintains cached shortest-route fields
+  // and evaluates every legal step without adopting human support objectives.
+  const AllyBrain=(()=>{
+    const index=(x,y)=>y*COLS+x;
+    let atlasRevision=-1;
+    let routeAtlas=[];
+
+    function buildField(target,isPassable){
+      const field=new Int16Array(COLS*ROWS);
+      field.fill(-1);
+      const queueX=new Int16Array(COLS*ROWS);
+      const queueY=new Int16Array(COLS*ROWS);
+      let read=0,write=0;
+      field[index(target.x,target.y)]=0;
+      queueX[write]=target.x;queueY[write++]=target.y;
+      while(read<write){
+        const x=queueX[read],y=queueY[read++];
+        const nextDistance=field[index(x,y)]+1;
+        for(const d of dirs){
+          const nx=x+d.x,ny=y+d.y;
+          if(!isPassable(nx,ny,target)) continue;
+          const nextIndex=index(nx,ny);
+          if(field[nextIndex]>=0) continue;
+          field[nextIndex]=nextDistance;
+          queueX[write]=nx;queueY[write++]=ny;
+        }
+      }
+      return field;
+    }
+
+    // At level start every floor cell receives a full distance field. These
+    // fields describe only the permanent maze geometry, so a passing creature,
+    // player or egg can never make the AI forget that its prey is reachable.
+    function scanMaze(force=false){
+      if(!force&&atlasRevision===mazeRevision&&routeAtlas.length) return;
+      routeAtlas=new Array(COLS*ROWS).fill(null);
+      const permanentFloor=(x,y)=>
+        x>=0&&y>=0&&x<COLS&&y<ROWS&&!isWall(x,y);
+      for(let y=0;y<ROWS;y++){
+        for(let x=0;x<COLS;x++){
+          if(!permanentFloor(x,y)) continue;
+          routeAtlas[index(x,y)]=buildField({x,y},permanentFloor);
+        }
+      }
+      atlasRevision=mazeRevision;
+    }
+
+    function nearestRouteTarget(target){
+      const rounded={
+        x:Math.max(0,Math.min(COLS-1,Math.round(target.x))),
+        y:Math.max(0,Math.min(ROWS-1,Math.round(target.y)))
+      };
+      if(!isWall(rounded.x,rounded.y)) return rounded;
+      for(let radius=1;radius<Math.max(COLS,ROWS);radius++){
+        for(let dy=-radius;dy<=radius;dy++){
+          for(let dx=-radius;dx<=radius;dx++){
+            if(Math.abs(dx)+Math.abs(dy)!==radius) continue;
+            const x=rounded.x+dx,y=rounded.y+dy;
+            if(x>=0&&y>=0&&x<COLS&&y<ROWS&&!isWall(x,y)) return {x,y};
+          }
+        }
+      }
+      return {x:1,y:1};
+    }
+
+    function fieldFor(target,t,traveler=null){
+      scanMaze();
+      const safe=nearestRouteTarget(target);
+      return routeAtlas[index(safe.x,safe.y)];
+    }
+
+    function distance(from,target,t,traveler=null){
+      if(!from||from.x<0||from.y<0||from.x>=COLS||from.y>=ROWS)
+        return Infinity;
+      const value=fieldFor(target,t,traveler)[index(from.x,from.y)];
+      return value<0?Infinity:value;
+    }
+
+    // Route to a bite target without pretending that the rest of that same
+    // snake is empty floor. This is especially important in one-cell tunnels:
+    // a middle segment behind the tail is not a reachable split opportunity.
+    function objectiveFieldFor(objective,t,traveler){
+      const safe=nearestRouteTarget(objective.target);
+      const targetSnake=objective?.details?.snake||null;
+      const occupiedByTargetSnake=new Set(
+        (targetSnake?.body||[]).map(cell=>`${cell.x},${cell.y}`)
+      );
+      const passable=(x,y,goal)=>{
+        if(x<0||y<0||x>=COLS||y>=ROWS||isWall(x,y)) return false;
+        if(x===goal.x&&y===goal.y) return true;
+        return !occupiedByTargetSnake.has(`${x},${y}`);
+      };
+      return buildField(safe,passable);
+    }
+
+    function detourFieldFor(target,t,traveler){
+      const safe=nearestRouteTarget(target);
+      const passable=(x,y,goal)=>{
+        if(x<0||y<0||x>=COLS||y>=ROWS||isWall(x,y)) return false;
+        if(x===goal.x&&y===goal.y) return true;
+        if(x===traveler.x&&y===traveler.y) return true;
+        if(occupiedBySolidEgg(x,y,t)||teammateAt(traveler,x,y)) return false;
+        if(snakes.some(s=>s.body.some(cell=>cell.x===x&&cell.y===y))) return false;
+        if(!isPowerMode(traveler,t)){
+          if(hunters.some(h=>h.x===x&&h.y===y)) return false;
+          if(hunters.some(h=>h.x+h.dir.x===x&&h.y+h.dir.y===y)) return false;
+          if(snakes.some(s=>
+            s.body[0]&&s.body[0].x+s.dir.x===x&&s.body[0].y+s.dir.y===y
+          )) return false;
+        }
+        return true;
+      };
+      return buildField(safe,passable);
+    }
+
+    function legalDirections(p,t){
+      return dirs.filter(d=>{
+        const x=p.x+d.x,y=p.y+d.y;
+        return !isWall(x,y)&&!occupiedBySolidEgg(x,y,t)&&
+          !teammateAt(p,x,y);
+      });
+    }
+
+    function collisionValue(p,d,x,y,t,objective=null){
+      const powered=isPowerMode(p,t);
+      const targetSnake=objective?.details?.snake||p.aiLockedSnake;
+      const target=objective?.target||null;
+      const hunter=hunters.find(h=>h.x===x&&h.y===y);
+      if(hunter) return powered?-180:100000;
+
+      for(const s of snakes){
+        const bodyIndex=s.body.findIndex(cell=>cell.x===x&&cell.y===y);
+        if(bodyIndex<0) continue;
+        const isExactTarget=s===targetSnake&&target&&target.x===x&&target.y===y;
+        // Only the deliberately selected tail, head or middle segment may be
+        // entered. All unrelated segments remain tactical obstacles.
+        if(!isExactTarget) return 100000;
+        if(bodyIndex===0){
+          if(powered) return -170;
+          const safeHeadBite=s.body.length===1
+            ? !(d.x===-s.dir.x&&d.y===-s.dir.y)
+            : d.x===s.dir.x&&d.y===s.dir.y;
+          return safeHeadBite?-125:100000;
+        }
+        if(bodyIndex===s.body.length-1) return -150;
+        return objective?.details?.kind==='split'?-185:100000;
+      }
+      return 0;
+    }
+
+    function surroundingDanger(p,d,x,y,t){
+      if(isPowerMode(p,t)) return 0;
+      let danger=0;
+      for(const s of snakes){
+        const head=s.body[0];
+        const manhattan=Math.abs(head.x-x)+Math.abs(head.y-y);
+        const frontX=head.x+s.dir.x,frontY=head.y+s.dir.y;
+        if(x===frontX&&y===frontY) danger+=150;
+        else if(manhattan===1) danger+=54;
+        else if(manhattan===2) danger+=13;
+      }
+      for(const h of hunters){
+        const manhattan=Math.abs(h.x-x)+Math.abs(h.y-y);
+        const frontX=h.x+h.dir.x,frontY=h.y+h.dir.y;
+        if(x===frontX&&y===frontY) danger+=175;
+        else if(manhattan===1) danger+=115;
+        else if(manhattan===2) danger+=30;
+      }
+      return danger;
+    }
+
+    function splitBodyIndexes(s){
+      if(!s||s.body.length<3) return [];
+      const center=(s.body.length-1)/2;
+      return Array.from({length:s.body.length-2},(_,i)=>i+1)
+        .sort((a,b)=>Math.abs(a-center)-Math.abs(b-center));
+    }
+
+    // A bite already available in the next cell must happen now. Strategic
+    // replanning is not allowed to make the ally step away from an exposed
+    // middle or tail. In Power Mode heads and hunters become explicit prey.
+    function immediateAttackObjective(p,t,options){
+      const powered=isPowerMode(p,t);
+      const attacks=[];
+      options.forEach(d=>{
+        const x=p.x+d.x,y=p.y+d.y;
+        if(powered){
+          const hunter=hunters.find(h=>h.x===x&&h.y===y);
+          if(hunter){
+            attacks.push({
+              type:'power-eat-hunter',target:{x,y},score:-400,
+              details:{hunter,kind:'hunter',immediate:true},d
+            });
+          }
+        }
+        snakes.forEach(s=>{
+          const bodyIndex=s.body.findIndex(cell=>cell.x===x&&cell.y===y);
+          if(bodyIndex<0) return;
+          const isHead=bodyIndex===0;
+          const isTail=bodyIndex===s.body.length-1&&bodyIndex>0;
+          const kind=isHead?'head':isTail?'tail':'split';
+          if(isHead&&!powered){
+            const probe={target:{x,y},details:{snake:s,kind}};
+            if(collisionValue(p,d,x,y,t,probe)>=100000) return;
+          }
+          const priority=powered&&isHead?-300:kind==='split'?-240:
+            kind==='tail'?-220:-180;
+          const locked=s===p.aiLockedSnake?-12:0;
+          const straight=d.x===p.dir.x&&d.y===p.dir.y?-6:0;
+          attacks.push({
+            type:powered&&isHead?'power-eat-snake-head':
+              kind==='split'?'immediate-split':
+              kind==='tail'?'immediate-tail-bite':'immediate-head-bite',
+            target:{x,y},score:priority+locked+straight,
+            details:{snake:s,kind,bodyIndex,immediate:true},d
+          });
+        });
+      });
+      attacks.sort((a,b)=>a.score-b.score);
+      return attacks[0]||null;
+    }
+
+    function chooseObjective(p,t){
+      const objectives=[];
+      const firstStepRisk=(objective,field)=>{
+        const steps=legalDirections(p,t).map(d=>{
+          const x=p.x+d.x,y=p.y+d.y;
+          const routeDistance=field[index(x,y)];
+          const collision=collisionValue(p,d,x,y,t,objective);
+          const danger=surroundingDanger(p,d,x,y,t);
+          return {routeDistance,collision,danger};
+        }).filter(step=>step.routeDistance>=0);
+        if(!steps.length) return 80;
+        const bestDistance=Math.min(...steps.map(step=>step.routeDistance));
+        const bestSteps=steps.filter(step=>step.routeDistance===bestDistance);
+        const safest=Math.min(...bestSteps.map(step=>
+          (step.collision>=100000?55:0)+
+          (step.danger>=105?18:step.danger/35)
+        ));
+        return safest;
+      };
+
+      const consider=(type,target,base,details={})=>{
+        const objective={
+          type,
+          target:{x:target.x,y:target.y},
+          score:0,
+          details:{...details}
+        };
+        const field=objectiveFieldFor(objective,t,p);
+        const routeDistance=field[index(p.x,p.y)];
+        if(routeDistance<0) return false;
+        const loyalty=details.snake===p.aiLockedSnake&&
+          details.kind===p.aiTargetKind?-0.35:0;
+        objective.score=base+routeDistance+
+          firstStepRisk(objective,field)+loyalty;
+        objectives.push(objective);
+        return true;
+      };
+
+      // Re-evaluate every snake on every move. A small loyalty tie-breaker keeps
+      // an equally good plan stable, but a shorter tail, a profitable middle
+      // bite or a newly dangerous first step changes the target immediately.
+      p.aiHuntQueue=(p.aiHuntQueue||[]).filter(s=>snakes.includes(s));
+      if(p.aiLockedSnake&&!snakes.includes(p.aiLockedSnake)){
+        p.aiLockedSnake=null;
+        p.aiHasBittenLockedSnake=false;
+        p.aiCommitMode=null;
+      }
+
+      // Power Mode changes the role of dangerous heads and hostile people:
+      // they are now profitable targets, not merely harmless obstacles.
+      if(isPowerMode(p,t)){
+        hunters.forEach(h=>consider(
+          'power-hunt-enemy',h,-34,{hunter:h,kind:'hunter',powered:true}
+        ));
+        snakes.forEach(s=>{
+          if(!s.body.length) return;
+          consider('power-hunt-head',s.body[0],-38,{
+            snake:s,kind:'head',bodyIndex:0,powered:true
+          });
+        });
+        objectives.sort((a,b)=>a.score-b.score);
+        if(objectives.length) return objectives[0];
+      }
+
+      // A chosen middle bite is a real tactical commitment, not a suggestion
+      // that is scored again on every cell. Follow the same moving snake and
+      // the same relative part of its body until the split succeeds. Dynamic
+      // dangers may force a detour, but cannot make the ally oscillate between
+      // the tail and the middle of the same snake.
+      if(p.aiSplitCommit&&(
+        !snakes.includes(p.aiSplitCommit.snake)||
+        p.aiSplitCommit.snake.body.length<3
+      )) p.aiSplitCommit=null;
+      if(p.aiSplitCommit){
+        const committed=p.aiSplitCommit;
+        const s=committed.snake;
+        const bodyIndex=Math.max(1,Math.min(
+          s.body.length-2,
+          Math.round(committed.fraction*Math.max(1,s.body.length-1))
+        ));
+        const target=s.body[bodyIndex];
+        const splitStillReachable=consider('committed-split',target,-1000,{
+          snake:s,kind:'split',bodyIndex,committed:true
+        });
+        if(splitStillReachable) return objectives[0];
+
+        // If the exact moving segment became hidden by a turn, keep the split
+        // intention and retarget another reachable internal segment of the
+        // same snake before considering any retreat or different prey.
+        splitBodyIndexes(s).filter(i=>i!==bodyIndex).forEach(i=>{
+          const centerPenalty=Math.abs(i-(s.body.length-1)/2)*0.15;
+          consider('committed-split-retarget',s.body[i],-900+centerPenalty,{
+            snake:s,kind:'split',bodyIndex:i,committed:true
+          });
+        });
+        objectives.sort((a,b)=>a.score-b.score);
+        if(objectives.length){
+          const replacement=objectives[0];
+          p.aiSplitCommit.fraction=replacement.details.bodyIndex/
+            Math.max(1,s.body.length-1);
+          return replacement;
+        }
+
+        // Only when no internal segment can be reached at all may the attack
+        // fall back to the physical tail.
+        p.aiSplitCommit=null;
+      }
+
+      // Once the ally has reached and bitten a tail, keep following the new
+      // physical end after every removed segment. Without this explicit state,
+      // the next scoring pass could prefer a middle cell and make the ally stop
+      // directly beside the snake instead of completing the bite sequence.
+      if(p.aiHasBittenLockedSnake&&p.aiLockedSnake&&
+        snakes.includes(p.aiLockedSnake)&&p.aiLockedSnake.body.length){
+        const s=p.aiLockedSnake;
+        const target=s.body.length>1?s.body[s.body.length-1]:s.body[0];
+        const kind=s.body.length>1?'tail':'head';
+        consider('committed-tail-finish',target,-1000,{
+          snake:s,kind,committed:true
+        });
+        if(objectives.length) return objectives[0];
+        return {
+          type:'committed-tail-wait',
+          target:{x:target.x,y:target.y},
+          score:10000,
+          details:{snake:s,kind,committed:true}
+        };
+      }
+
+      // Honour a fixed snake. If its tail is cut off by its own body geometry,
+      // actively search every internal segment of that same snake for a split
+      // route instead of approaching the head and reversing at the last cell.
+      if(p.aiLockedSnake&&snakes.includes(p.aiLockedSnake)&&
+        !p.aiHasBittenLockedSnake){
+        const s=p.aiLockedSnake;
+        const tail=s.body.length>1?s.body[s.body.length-1]:s.body[0];
+        const tailReachable=consider(
+          'locked-snake-tail',tail,-1,{snake:s,kind:s.body.length>1?'tail':'head'}
+        );
+        if(!tailReachable&&s.body.length>=3){
+          splitBodyIndexes(s).forEach(i=>{
+            const centerPenalty=Math.abs(i-(s.body.length-1)/2)*0.2;
+            consider('locked-snake-split',s.body[i],-12+centerPenalty,{
+              snake:s,kind:'split',bodyIndex:i
+            });
+          });
+          objectives.sort((a,b)=>a.score-b.score);
+          if(objectives.length) return objectives[0];
+        }
+        objectives.length=0;
+      }
+
+      snakes.forEach(s=>{
+        const tail=s.body.length>1?s.body[s.body.length-1]:s.body[0];
+        const tailKind=s.body.length>1?'tail':'head';
+        consider(s.body.length>1?'eat-tail':'eat-solitary-head',tail,0,{
+          snake:s,kind:tailKind
+        });
+
+        if(s.body.length>=3){
+          const indexes=splitBodyIndexes(s);
+          const splitBonus=Math.min(6.5,4.2+s.body.length*0.2);
+          indexes.forEach(bodyIndex=>consider(
+            'split-snake',s.body[bodyIndex],-splitBonus+
+              Math.abs(bodyIndex-(s.body.length-1)/2)*0.2,
+            {snake:s,kind:'split',bodyIndex}
+          ));
+        }
+      });
+
+      objectives.sort((a,b)=>a.score-b.score);
+      if(objectives.length) return objectives[0];
+
+      // When no legal attack route currently exists, preserve momentum. The
+      // next move will scan again as the reversing snake changes shape. This
+      // avoids the old head-side forward/backward loop.
+      return null;
+    }
+
+    function plan(p,t){
+      if(!p?.isAI||p.dead) return;
+      p.pointerNavigation=null;
+      p.waitingForInput=false;
+      const options=legalDirections(p,t);
+      if(!options.length) return;
+      const immediateObjective=immediateAttackObjective(p,t,options);
+      const objective=immediateObjective||chooseObjective(p,t);
+      const objectiveSnake=objective?.details?.snake||null;
+      if(objective?.details?.kind==='split'&&
+        objectiveSnake?.body?.length>=3){
+        if(!p.aiSplitCommit||p.aiSplitCommit.snake!==objectiveSnake||
+          objective.details.immediate){
+          p.aiSplitCommit={
+            snake:objectiveSnake,
+            fraction:objective.details.bodyIndex/
+              Math.max(1,objectiveSnake.body.length-1),
+            startedAt:t
+          };
+        }
+      }
+      if(objectiveSnake&&objectiveSnake!==p.aiLockedSnake){
+        const mode=objective.type.includes('split')?'split-target':'hunt';
+        commitTo(p,objectiveSnake,mode,t);
+      }
+      if(objective?.details?.kind) p.aiTargetKind=objective.details.kind;
+      let field=objective?objectiveFieldFor(objective,t,p):null;
+      if(!p.aiVisited) p.aiVisited=new Map();
+      p.aiVisited.set(`${p.x},${p.y}`,t);
+      for(const [key,visitedAt] of p.aiVisited){
+        if(t-visitedAt>5500) p.aiVisited.delete(key);
+      }
+
+      // The atlas chooses the strategic route. Only when its best next cell is
+      // currently occupied or immediately lethal do we calculate a temporary
+      // detour; the locked prey itself never changes.
+      if(field&&objective){
+        const atlasSteps=dirs.map(d=>({
+          d,x:p.x+d.x,y:p.y+d.y,
+          distance:(p.x+d.x<0||p.y+d.y<0||p.x+d.x>=COLS||p.y+d.y>=ROWS)
+            ?-1:field[index(p.x+d.x,p.y+d.y)]
+        })).filter(step=>step.distance>=0)
+          .sort((a,b)=>a.distance-b.distance);
+        const ideal=atlasSteps[0];
+        const idealLegal=ideal&&options.some(d=>d.x===ideal.d.x&&d.y===ideal.d.y);
+        const idealCollision=ideal
+          ?collisionValue(p,ideal.d,ideal.x,ideal.y,t,objective):0;
+        const idealDanger=ideal
+          ?surroundingDanger(p,ideal.d,ideal.x,ideal.y,t):0;
+        const needsDetour=ideal&&(
+          !idealLegal||idealCollision>=100000||idealDanger>=105
+        );
+        if(needsDetour) p.aiDetourUntil=t+1100;
+        if(needsDetour||p.aiDetourUntil>t){
+          const detour=detourFieldFor(objective.target,t,p);
+          if(detour[index(p.x,p.y)]>=0) field=detour;
+        }
+      }
+
+      const ranked=options.map(d=>{
+        const x=p.x+d.x,y=p.y+d.y;
+        const collision=collisionValue(p,d,x,y,t,objective);
+        const danger=surroundingDanger(p,d,x,y,t);
+        const routeDistance=field?field[index(x,y)]:0;
+        const unreachable=field&&routeDistance<0;
+        const lethal=collision>=100000;
+        const recent=p.aiVisited.get(`${x},${y}`);
+        const revisitTieBreaker=recent?Math.max(0,1-(t-recent)/5500):0;
+        const straightTieBreaker=d.x===p.dir.x&&d.y===p.dir.y?-0.2:0;
+        const reversingHead=p.aiLockedSnake?.reversing&&
+          p.aiLockedSnake.body[0];
+        const currentHeadDistance=reversingHead
+          ?Math.abs(reversingHead.x-p.x)+Math.abs(reversingHead.y-p.y):0;
+        const nextHeadDistance=reversingHead
+          ?Math.abs(reversingHead.x-x)+Math.abs(reversingHead.y-y):0;
+        // If neither the tail nor any middle segment of a reversing snake is
+        // reachable, do not follow its receding head through the corridor.
+        // Move sideways/away until its changing body exposes a legal attack.
+        const reverseHeadPenalty=!objective&&reversingHead&&
+          nextHeadDistance<currentHeadDistance?250000:0;
+        return {
+          d,x,y,
+          // Lexicographic priorities encoded as separate scales:
+          // reachable + safe, then exact atlas distance, then local danger;
+          // direction and recent visits can only break a genuine tie.
+          score:(lethal?1000000000:0)+(unreachable?500000000:0)+
+            (routeDistance<0?0:routeDistance*10000)+danger*25+
+            collision+reverseHeadPenalty+revisitTieBreaker+straightTieBreaker
+        };
+      }).sort((a,b)=>a.score-b.score);
+
+      const choice=ranked[0];
+      p.nextDir={...choice.d};
+      p.aiThought={
+        type:objective?.type||'explore',
+        target:objective?.target||{x:choice.x,y:choice.y},
+        danger:Math.round(surroundingDanger(p,choice.d,choice.x,choice.y,t)),
+        score:choice.score
+      };
+      p.aiLastDirection={...choice.d};
+      p.aiDecisionAt=t;
+    }
+
+    function commitTo(p,s,mode='finish',t=performance.now()){
+      if(!p?.isAI||!s||!snakes.includes(s)||!s.body.length) return;
+      if(p.aiSplitCommit&&p.aiSplitCommit.snake!==s) p.aiSplitCommit=null;
+      p.aiLockedSnake=s;
+      p.aiCommitMode=mode;
+      p.aiHasBittenLockedSnake=mode==='finish'||mode==='finish-split';
+      p.aiCommitUntil=t+(mode==='finish-split'?24000:18000);
+    }
+
+    function noteTailBite(p,s){
+      if(p?.isAI&&p.aiLockedSnake&&p.aiLockedSnake!==s) return;
+      if(p?.aiSplitCommit?.snake===s) p.aiSplitCommit=null;
+      commitTo(p,s,'finish');
+    }
+
+    function lockNextAvailable(p,t=performance.now()){
+      if(!p?.isAI||p.aiLockedSnake) return;
+      p.aiHuntQueue=(p.aiHuntQueue||[]).filter(part=>snakes.includes(part));
+      if(p.aiHuntQueue.length){
+        commitTo(p,p.aiHuntQueue.shift(),'finish-split',t);
+        return;
+      }
+      const next=snakes.slice().sort((a,b)=>{
+        const at=a.body.length>1?a.body[a.body.length-1]:a.body[0];
+        const bt=b.body.length>1?b.body[b.body.length-1]:b.body[0];
+        return distance(p,at,t,p)-distance(p,bt,t,p);
+      })[0];
+      if(next) commitTo(p,next,'hunt',t);
+    }
+
+    function noteCompleted(p,s,replacement=null){
+      if(!p?.isAI) return;
+      if(p.aiLockedSnake&&p.aiLockedSnake!==s) return;
+      if(p.aiSplitCommit?.snake===s) p.aiSplitCommit=null;
+      if(replacement&&snakes.includes(replacement)){
+        commitTo(p,replacement,'finish');
+        return;
+      }
+      if(p.aiLockedSnake===s){
+        p.aiLockedSnake=null;
+        p.aiHasBittenLockedSnake=false;
+        p.aiCommitMode=null;
+      }
+      p.aiHuntQueue=(p.aiHuntQueue||[]).filter(part=>snakes.includes(part));
+      if(!p.aiLockedSnake&&p.aiHuntQueue.length)
+        commitTo(p,p.aiHuntQueue.shift(),'finish-split');
+      lockNextAvailable(p);
+    }
+
+    function noteSplit(p,original,created){
+      if(!p?.isAI) return;
+      if(p.aiLockedSnake&&p.aiLockedSnake!==original) return;
+      if(p.aiSplitCommit?.snake===original) p.aiSplitCommit=null;
+      const viable=created.filter(part=>snakes.includes(part)&&part.body.length);
+      viable.sort((a,b)=>{
+        const aTarget=a.body.length>1?a.body[a.body.length-1]:a.body[0];
+        const bTarget=b.body.length>1?b.body[b.body.length-1]:b.body[0];
+        return distance(p,aTarget,performance.now(),p)-
+          distance(p,bTarget,performance.now(),p);
+      });
+      const previousQueue=(p.aiHuntQueue||[]).filter(part=>
+        snakes.includes(part)&&!viable.includes(part)
+      );
+      p.aiLockedSnake=viable.shift()||null;
+      p.aiHuntQueue=[...viable,...previousQueue];
+      p.aiCommitMode='finish-split';
+      p.aiTargetKind='tail';
+      p.aiHasBittenLockedSnake=true;
+      p.aiCommitUntil=performance.now()+24000;
+      if(!p.aiLockedSnake) lockNextAvailable(p);
+    }
+
+    function beginLevel(t=performance.now()){
+      scanMaze(true);
+      allPlayers().filter(p=>p.isAI).forEach(p=>{
+        p.aiLockedSnake=null;
+        p.aiHuntQueue=[];
+        p.aiSplitCommit=null;
+        p.aiCommitMode=null;
+        p.aiTargetKind=null;
+        p.aiHasBittenLockedSnake=false;
+        p.aiDetourUntil=0;
+        p.aiVisited=new Map();
+        lockNextAvailable(p,t);
+      });
+    }
+
+    return {
+      plan,distance,fieldFor,scanMaze,beginLevel,commitTo,
+      noteTailBite,noteCompleted,noteSplit
+    };
   })();
 
   function rand(a,b){ return a + Math.random()*(b-a); }
@@ -689,6 +2230,12 @@
     return scaledScorpionDelay(minimum,maximum)/encounterPressure(t);
   }
 
+  function scaledRepeatEggDelay(minimum,maximum,t=performance.now()){
+    // The first possible egg from each scorpion keeps its original timing.
+    // After an egg has been laid, subsequent chances occur half as often.
+    return scaledEggDelay(minimum,maximum,t)*2;
+  }
+
   function scaledScorpionSpawnDelay(minimum,maximum,t=performance.now()){
     return scaledScorpionDelay(minimum,maximum)/encounterPressure(t);
   }
@@ -698,7 +2245,7 @@
       const x=1+((Math.random()*(COLS-2))|0);
       const y=1+((Math.random()*(ROWS-2))|0);
       if(isWall(x,y)) continue;
-      if(player && player.x===x && player.y===y) continue;
+      if(allPlayers().some(p=>!p.dead&&p.x===x&&p.y===y)) continue;
       if(snakes && snakes.some(s=>s.body.some(p=>p.x===x&&p.y===y))) continue;
       if(scorpion && scorpion.x===x && scorpion.y===y) continue;
       if(eggs && eggs.some(e=>e.x===x&&e.y===y)) continue;
@@ -741,9 +2288,12 @@
   }
 
   function isEggCovered(e) {
-    const playerX=player.dead ? player.deathX : player.x;
-    const playerY=player.dead ? player.deathY : player.y;
-    const playerCoversEgg=playerX===e.x && playerY===e.y;
+    const playerCoversEgg=allPlayers().some(p=>{
+      if(p.dead&&p.hideDeathSprite) return false;
+      const px=p.dead?p.deathX:p.x;
+      const py=p.dead?p.deathY:p.y;
+      return px===e.x&&py===e.y;
+    });
     const snakeCoversEgg=snakes.some(s=>
       s.body.some(p=>p.x===e.x && p.y===e.y)
     );
@@ -758,20 +2308,51 @@
       hunterCoversEgg || fruitCoversEgg;
   }
 
+  function createPlayerState(id,previous=null){
+    const start=PLAYER_STARTS[id-1];
+    const now=performance.now();
+    return {
+      id,
+      isAI:id===alliedAiPlayerId,
+      x:start.x,y:start.y,prevX:start.x,prevY:start.y,
+      dir:{...start.dir},nextDir:{...start.dir},
+      mouthOpen:false,waitingForInput:id!==alliedAiPlayerId,
+      dead:false,eliminated:false,hideDeathSprite:false,
+      deathX:start.x,deathY:start.y,respawnAt:0,
+      score:previous?.score||0,
+      lives:previous?.lives??3,
+      nextExtraLifeScore:previous?.nextExtraLifeScore||1000,
+      extraLivesEarned:previous?.extraLivesEarned||0,
+      aggressionContribution:previous?.aggressionContribution||0,
+      aiThought:null,aiDecisionAt:0,
+      aiLockedSnake:null,aiHuntQueue:[],aiSplitCommit:null,aiCommitMode:null,
+      aiCommitUntil:0,aiHasBittenLockedSnake:false,aiDetourUntil:0,
+      aiTargetKind:null,aiLastDirection:null,
+      pointerNavigation:null,
+      powerModeUntil:0,powerFlashBright:false,lastPowerFlashAt:0,
+      spawnShieldUntil:0,spawnFlashBright:false,lastSpawnFlashAt:0,
+      lastMove:0,lastMouthAt:now,
+      moveFromX:start.x,moveFromY:start.y,
+      moveToX:start.x,moveToY:start.y,
+      moveStartedAt:now,moveDuration:95*PLAYER_SLIDE_RATIO
+    };
+  }
 
   function reset(full=true) {
-    if (full) { score=0;
-    nextExtraLifeScore=1000; extraLivesEarned=0; lives=3; level=1; }
+    if(full){
+      level=1;
+      mazeRunSeed=(Date.now()^Math.floor(Math.random()*0xFFFFFFFF))>>>0;
+    }
+    applyMazeForLevel(level);
     gameOver=false; paused=false; tickCount=0;
-    pointerNavigation=null;
-    powerModeUntil=0;
-    powerFlashBright=false;
-    spawnShieldUntil=0;
-    spawnFlashBright=false;
-    lastPowerFlashAt=0;
-    activateSpawnShield();
-    player={x:PLAYER_START.x,y:PLAYER_START.y,prevX:PLAYER_START.x,prevY:PLAYER_START.y,dir:{...PLAYER_START_DIR},nextDir:{...PLAYER_START_DIR},mouthOpen:false,waitingForInput:true,dead:false,deathX:PLAYER_START.x,deathY:PLAYER_START.y,respawnAt:0};
-    lastPlayerMouthAt=performance.now();
+    player=createPlayerState(1,full?null:player);
+    player2=activePlayerCount>=2
+      ? createPlayerState(2,full?null:player2)
+      : null;
+    player3=activePlayerCount>=3
+      ? createPlayerState(3,full?null:player3)
+      : null;
+    allPlayers().forEach(p=>activateSpawnShield(p));
     spawnSnakesForLevel();
     fruits=[];
     eggs=[];
@@ -780,9 +2361,19 @@
     scorpion=null;
     scorpionKilled=false;
     levelStartedAt=performance.now();
+    AllyBrain.beginLevel(levelStartedAt);
     scorpionSpawnAt=levelStartedAt+
       scaledScorpionSpawnDelay(15000,30000,levelStartedAt);
     updateHud();
+  }
+
+  function startNewGame(mode){
+    gameMode=Math.max(1,Math.min(4,mode|0));
+    humanPlayerCount=(gameMode===2||gameMode===4)?2:1;
+    alliedAiPlayerId=gameMode===3?2:gameMode===4?3:0;
+    activePlayerCount=humanPlayerCount+(alliedAiPlayerId?1:0);
+    awaitingPlayerSelection=false;
+    reset(true);
   }
   const SNAKE_PALETTE=['#35e55b','#66c2ff','#d66bff'];
 const HUNTER_PALETTE=['#ff9b55','#62d6ff','#ff66c4','#ffe066','#9b7bff','#74e88b'];
@@ -845,7 +2436,7 @@ function makeSnake(x,y,len,dir) {
       !isWall(cellX,cellY) &&
       !occupied.has(`${cellX},${cellY}`) &&
       !ownBody.has(`${cellX},${cellY}`) &&
-      !(player && player.x===cellX && player.y===cellY);
+      !allPlayers().some(p=>!p.dead&&p.x===cellX&&p.y===cellY);
 
     // If a designed head position is unavailable, find the nearest free tile.
     let head={x,y};
@@ -920,63 +2511,88 @@ function makeSnake(x,y,len,dir) {
       lastAngerTime:0,
       lastMemoryTick:0,
       temperament:0.2 + Math.random()*0.6,
+      threatByPlayer:[0,0,0],
       lastMove:0,
       turnBias:Math.random()
     };
   }
-  function updateHud(){
+  function updateHud(specificPlayer=null){
     let gainedLives=0;
-    while(score>=nextExtraLifeScore){
-      lives++;
-      gainedLives++;
-      extraLivesEarned++;
-      const nextGap=extraLivesEarned<5
-        ? 1000
-        : extraLivesEarned<10
-          ? 2000
-          : 5000;
-      nextExtraLifeScore+=nextGap;
-    }
+    const candidates=specificPlayer?[specificPlayer]:allPlayers();
+    candidates.forEach(p=>{
+      while(p.score>=p.nextExtraLifeScore){
+        p.lives++;
+        gainedLives++;
+        p.extraLivesEarned++;
+        const nextGap=p.extraLivesEarned<5
+          ? 1000
+          : p.extraLivesEarned<10
+            ? 2000
+            : 5000;
+        p.nextExtraLifeScore+=nextGap;
+      }
+    });
     if(gainedLives) playSound('BonusLife@');
-
     renderHud();
+  }
+
+  function awardPoints(p,amount,provocation=0){
+    if(!p) return;
+    p.score+=amount;
+    p.aggressionContribution=Math.max(
+      0,
+      (p.aggressionContribution||0)+provocation
+    );
+    updateHud(p);
+  }
+
+  function provokeCreature(entity,p,amount,recordPlayer=true){
+    if(!entity||!p||amount<=0) return;
+    if(!entity.threatByPlayer) entity.threatByPlayer=[0,0,0];
+    entity.threatByPlayer[p.id-1]=
+      (entity.threatByPlayer[p.id-1]||0)+amount;
+    if(recordPlayer){
+      p.aggressionContribution=(p.aggressionContribution||0)+amount;
+    }
   }
 
   function renderHud(){
     bctx.fillStyle='#000';
     bctx.fillRect(0,0,bitmapHud.width,bitmapHud.height);
-    drawBitmapText(bctx,`SCORE ${String(score).padStart(4,'0')}`,0,0);
-    drawBitmapText(bctx,`LEVEL ${level}`,0,16);
-    drawBitmapText(bctx,`LIVES ${lives}`,512,0,{align:'right'});
-    drawBitmapText(bctx,`VIPERS ${snakes.length}`,512,16,{align:'right'});
+    const roster=allPlayers();
+    const label=p=>p.isAI?'AI':`P${p.id}`;
+    if(roster.length<3){
+      drawBitmapText(bctx,`${label(player)} ${String(player.score).padStart(4,'0')}`,0,0);
+      drawBitmapText(bctx,`LIVES ${player.lives}`,0,16);
+      drawBitmapText(bctx,`LEVEL ${level}`,256,0,{align:'center'});
+      drawBitmapText(bctx,`VIPERS ${snakes.length}`,256,16,{align:'center'});
+      if(roster.length===2){
+        drawBitmapText(bctx,`${label(player2)} ${String(player2.score).padStart(4,'0')}`,512,0,{align:'right'});
+        drawBitmapText(bctx,`LIVES ${player2.lives}`,512,16,{align:'right'});
+      }
+    }else{
+      // Compact three-member team layout: scores above, individual lives
+      // below, with level and remaining vipers kept in the centre.
+      drawBitmapText(bctx,`P1 ${String(player.score).padStart(4,'0')}`,0,0);
+      drawBitmapText(bctx,`P2 ${String(player2.score).padStart(4,'0')}`,256,0,{align:'center'});
+      drawBitmapText(bctx,`AI ${String(player3.score).padStart(4,'0')}`,512,0,{align:'right'});
+      drawBitmapText(bctx,`L${player.lives}`,0,16);
+      drawBitmapText(bctx,`L${player2.lives} LV${level} V${snakes.length}`,256,16,{align:'center'});
+      drawBitmapText(bctx,`L${player3.lives}`,512,16,{align:'right'});
+    }
   }
 
-  function isPowerMode(t=performance.now()){
-    return powerModeUntil>t;
+  function isPowerMode(p,t=performance.now()){
+    return !!p&&p.powerModeUntil>t;
   }
 
-  function createPlayerAtStart(){
-    const now=performance.now();
-    return {
-      x:PLAYER_START.x,y:PLAYER_START.y,
-      prevX:PLAYER_START.x,prevY:PLAYER_START.y,
-      dir:{...PLAYER_START_DIR},
-      nextDir:{...PLAYER_START_DIR},
-      mouthOpen:false,
-      waitingForInput:true,
-      dead:false,
-      hideDeathSprite:false,
-      deathX:PLAYER_START.x,deathY:PLAYER_START.y,
-      respawnAt:0,
-      moveFromX:PLAYER_START.x,moveFromY:PLAYER_START.y,
-      moveToX:PLAYER_START.x,moveToY:PLAYER_START.y,
-      moveStartedAt:now,
-      moveDuration:playerMoveDelay(now)*PLAYER_SLIDE_RATIO
-    };
+  function createPlayerAtStart(p){
+    return createPlayerState(p.id,p);
   }
 
-  function playerStartIsClear(){
-    const x=PLAYER_START.x,y=PLAYER_START.y;
+  function playerStartIsClear(p){
+    const start=PLAYER_STARTS[p.id-1];
+    const x=start.x,y=start.y;
     return !isWall(x,y) &&
       !snakes.some(s=>s.body.some(p=>p.x===x&&p.y===y)) &&
       !(scorpion&&(
@@ -984,16 +2600,17 @@ function makeSnake(x,y,len,dir) {
         (scorpion.tailX===x&&scorpion.tailY===y)
       )) &&
       !hunters.some(h=>h.x===x&&h.y===y) &&
-      !eggs.some(e=>e.x===x&&e.y===y);
+      !eggs.some(e=>e.x===x&&e.y===y) &&
+      !allPlayers().some(other=>other!==p&&!other.dead&&other.x===x&&other.y===y);
   }
 
-  function playerVisualPosition(t=performance.now()){
-    if(player.dead) return {x:player.deathX,y:player.deathY};
-    const duration=Math.max(1,player.moveDuration||95);
-    const progress=Math.max(0,Math.min(1,(t-(player.moveStartedAt||t))/duration));
+  function playerVisualPosition(p,t=performance.now()){
+    if(p.dead) return {x:p.deathX,y:p.deathY};
+    const duration=Math.max(1,p.moveDuration||95);
+    const progress=Math.max(0,Math.min(1,(t-(p.moveStartedAt||t))/duration));
     return {
-      x:(player.moveFromX??player.x)+((player.moveToX??player.x)-(player.moveFromX??player.x))*progress,
-      y:(player.moveFromY??player.y)+((player.moveToY??player.y)-(player.moveFromY??player.y))*progress
+      x:(p.moveFromX??p.x)+((p.moveToX??p.x)-(p.moveFromX??p.x))*progress,
+      y:(p.moveFromY??p.y)+((p.moveToY??p.y)-(p.moveFromY??p.y))*progress
     };
   }
 
@@ -1110,7 +2727,7 @@ function makeSnake(x,y,len,dir) {
         ? s.headTrail[s.headTrail.length-1]
         : null;
       if(!previous ||
-         (previous.x===player.x&&previous.y===player.y) ||
+         !!playerAt(previous.x,previous.y) ||
          !canEnter(previous.x,previous.y,s,true)) return null;
 
       const retreatDir={x:previous.x-head.x,y:previous.y-head.y};
@@ -1153,7 +2770,7 @@ function makeSnake(x,y,len,dir) {
       if(!tailOptions.length) return null;
       const straight=tailOptions.find(d=>d.x===guideDir.x&&d.y===guideDir.y);
       const chosen=straight||tailOptions[0];
-      if(tail.x+chosen.x===player.x&&tail.y+chosen.y===player.y) return null;
+      if(playerAt(tail.x+chosen.x,tail.y+chosen.y)) return null;
 
       // Entering a corner changes the visible head form and remains snapped.
       if(snakeBodyPointIsCorner(s.body,1)) return null;
@@ -1231,110 +2848,114 @@ function makeSnake(x,y,len,dir) {
     };
   }
 
-  function resetPlayerVisualPosition(){
+  function resetPlayerVisualPosition(p){
     const now=performance.now();
-    player.moveFromX=player.x;
-    player.moveFromY=player.y;
-    player.moveToX=player.x;
-    player.moveToY=player.y;
-    player.moveStartedAt=now;
-    player.moveDuration=playerMoveDelay(now)*PLAYER_SLIDE_RATIO;
+    p.moveFromX=p.x;
+    p.moveFromY=p.y;
+    p.moveToX=p.x;
+    p.moveToY=p.y;
+    p.moveStartedAt=now;
+    p.moveDuration=playerMoveDelay(p,now)*PLAYER_SLIDE_RATIO;
   }
 
-  function activatePowerMode(t=performance.now()){
-    powerModeUntil=t+10000;
-    powerFlashBright=true;
-    lastPowerFlashAt=t;
+  function activatePowerMode(p,t=performance.now()){
+    // A new fruit contributes ten full seconds. If Power Mode is already
+    // active, extend its existing end instead of restarting the countdown.
+    p.powerModeUntil=Math.max(t,p.powerModeUntil||0)+10000;
+    p.powerFlashBright=true;
+    p.lastPowerFlashAt=t;
     playSound('snakeSTART@');
   }
 
-  function updatePowerMode(t){
-    if(!isPowerMode(t)){
-      powerModeUntil=0;
-      powerFlashBright=false;
+  function updatePowerMode(p,t){
+    if(!isPowerMode(p,t)){
+      p.powerModeUntil=0;
+      p.powerFlashBright=false;
       return;
     }
 
-    const remaining=powerModeUntil-t;
+    const remaining=p.powerModeUntil-t;
     if(remaining>3000){
-      powerFlashBright=true;
-      lastPowerFlashAt=t;
+      p.powerFlashBright=true;
+      p.lastPowerFlashAt=t;
       return;
     }
 
-    if(t-lastPowerFlashAt>=320){
-      powerFlashBright=!powerFlashBright;
-      lastPowerFlashAt=t;
+    if(t-p.lastPowerFlashAt>=320){
+      p.powerFlashBright=!p.powerFlashBright;
+      p.lastPowerFlashAt=t;
       playSound('Tick');
     }
   }
 
-  function isSpawnProtected(t=performance.now()){
-    return spawnShieldUntil>t;
+  function isSpawnProtected(p,t=performance.now()){
+    return !!p&&p.spawnShieldUntil>t;
   }
 
-  function activateSpawnShield(t=performance.now()){
-    spawnShieldUntil=t+3000;
-    spawnFlashBright=true;
-    lastSpawnFlashAt=t;
+  function activateSpawnShield(p,t=performance.now()){
+    p.spawnShieldUntil=t+3000;
+    p.spawnFlashBright=true;
+    p.lastSpawnFlashAt=t;
   }
 
-  function updateSpawnShield(t){
-    if(!isSpawnProtected(t)){
-      spawnShieldUntil=0;
-      spawnFlashBright=false;
+  function updateSpawnShield(p,t){
+    if(!isSpawnProtected(p,t)){
+      p.spawnShieldUntil=0;
+      p.spawnFlashBright=false;
       return;
     }
 
-    if(t-lastSpawnFlashAt>=280){
-      spawnFlashBright=!spawnFlashBright;
-      lastSpawnFlashAt=t;
+    if(t-p.lastSpawnFlashAt>=280){
+      p.spawnFlashBright=!p.spawnFlashBright;
+      p.lastSpawnFlashAt=t;
     }
   }
 
-  function spawnShieldIsBlocking(t=performance.now()){
-    return isSpawnProtected(t) && !isPowerMode(t);
+  function spawnShieldIsBlocking(p,t=performance.now()){
+    return isSpawnProtected(p,t) && !isPowerMode(p,t);
   }
 
   // Collision direction matters in power mode. The player may eat an
   // inhabitant by actively entering its tile, but an inhabitant moving toward
   // a stationary powered player sees that tile as a dangerous obstacle.
   function playerRepelsInhabitant(x,y,t=performance.now()){
-    return player&&player.x===x&&player.y===y&&
-      (spawnShieldIsBlocking(t)||isPowerMode(t));
+    return livingPlayers().some(p=>
+      p.x===x&&p.y===y&&
+      (spawnShieldIsBlocking(p,t)||isPowerMode(p,t))
+    );
   }
 
-  function bumpPlayerBack(){
-    player.x=player.prevX;
-    player.y=player.prevY;
-    resetPlayerVisualPosition();
+  function bumpPlayerBack(p){
+    p.x=p.prevX;
+    p.y=p.prevY;
+    resetPlayerVisualPosition(p);
   }
 
-  function eatHunter(h){
+  function eatHunter(h,p){
     const index=hunters.indexOf(h);
     if(index<0) return;
     hunters.splice(index,1);
-    score+=200;
     playSound('HeadEat');
-    updateHud();
+    awardPoints(p,200,0.5);
   }
 
-  function setPlayerDirection(dx,dy) {
-    if(gameOver||paused||player.dead) return;
-    pointerNavigation=null;
-    player.nextDir={x:dx,y:dy};
-    player.waitingForInput=false;
+  function setPlayerDirection(p,dx,dy) {
+    if(gameOver||paused||p.dead) return;
+    p.pointerNavigation=null;
+    p.nextDir={x:dx,y:dy};
+    p.waitingForInput=false;
   }
 
-  function pointerNavigationStep(){
-    if(!pointerNavigation) return null;
-    const target=pointerNavigation;
-    if(player.x===target.x&&player.y===target.y) return null;
+  function pointerNavigationStep(p){
+    if(!p.pointerNavigation) return null;
+    const target=p.pointerNavigation;
+    if(p.x===target.x&&p.y===target.y) return null;
 
     const directionIsOpen=d=>{
       if(!d) return false;
-      const nx=player.x+d.x,ny=player.y+d.y;
-      return !isWall(nx,ny)&&!occupiedBySolidEgg(nx,ny);
+      const nx=p.x+d.x,ny=p.y+d.y;
+      return !isWall(nx,ny)&&!occupiedBySolidEgg(nx,ny)&&
+        !teammateAt(p,nx,ny);
     };
 
     // Until the preferred axis has actually been entered, preserve momentum.
@@ -1342,16 +2963,16 @@ function makeSnake(x,y,len,dir) {
     // turn instead of stopping or immediately reversing toward the secondary.
     if(!target.primaryTaken){
       if(directionIsOpen(target.primary)) return target.primary;
-      if(directionIsOpen(player.dir)) return {...player.dir};
+      if(directionIsOpen(p.dir)) return {...p.dir};
       if(directionIsOpen(target.secondary)) return target.secondary;
       return null;
     }
 
-    const queue=[{x:player.x,y:player.y,first:null}];
-    const visited=new Set([`${player.x},${player.y}`]);
+    const queue=[{x:p.x,y:p.y,first:null}];
+    const visited=new Set([`${p.x},${p.y}`]);
     let best=queue[0];
     let bestDistance=
-      Math.abs(player.x-target.x)+Math.abs(player.y-target.y);
+      Math.abs(p.x-target.x)+Math.abs(p.y-target.y);
 
     for(let q=0;q<queue.length;q++){
       const node=queue[q];
@@ -1384,60 +3005,62 @@ function makeSnake(x,y,len,dir) {
     return best.first;
   }
 
-  function advancePlayer() {
-    if(gameOver||paused||player.dead) return;
+  function advancePlayer(p) {
+    if(gameOver||paused||p.dead) return;
 
-    if(pointerNavigation){
-      if(player.x===pointerNavigation.x&&player.y===pointerNavigation.y){
-        pointerNavigation=null;
+    if(p.pointerNavigation){
+      if(p.x===p.pointerNavigation.x&&p.y===p.pointerNavigation.y){
+        p.pointerNavigation=null;
       }
-      const routeDirection=pointerNavigationStep();
+      const routeDirection=pointerNavigationStep(p);
       if(!routeDirection){
         // A click never applies the brakes. Keep the current momentum while
         // waiting for one of the requested directions to become available.
-        player.nextDir={...player.dir};
+        p.nextDir={...p.dir};
       }else{
-        player.nextDir={...routeDirection};
+        p.nextDir={...routeDirection};
       }
-      player.waitingForInput=false;
+      p.waitingForInput=false;
     }
-    if(player.waitingForInput) return;
+    if(p.waitingForInput) return;
 
     // Apply requested direction only if that path is open.
-    const tx=player.x+player.nextDir.x, ty=player.y+player.nextDir.y;
-    if(!isWall(tx,ty)) player.dir={...player.nextDir};
+    const tx=p.x+p.nextDir.x, ty=p.y+p.nextDir.y;
+    if(!isWall(tx,ty)&&!occupiedBySolidEgg(tx,ty)&&!teammateAt(p,tx,ty)){
+      p.dir={...p.nextDir};
+    }
 
-    const nx=player.x+player.dir.x, ny=player.y+player.dir.y;
+    const nx=p.x+p.dir.x, ny=p.y+p.dir.y;
     const eggBlocked = occupiedBySolidEgg(nx,ny);
-    if(!isWall(nx,ny) && !eggBlocked) {
+    if(!isWall(nx,ny) && !eggBlocked && !teammateAt(p,nx,ny)) {
       const moveStartedAt=performance.now();
-      player.prevX=player.x;
-      player.prevY=player.y;
-      player.moveFromX=player.x;
-      player.moveFromY=player.y;
-      player.x=nx;
-      player.y=ny;
-      player.moveToX=nx;
-      player.moveToY=ny;
-      player.moveStartedAt=moveStartedAt;
-      player.moveDuration=playerMoveDelay(moveStartedAt)*PLAYER_SLIDE_RATIO;
-      checkSnakeContact();
-      checkWorldContact();
-      if(pointerNavigation && !pointerNavigation.primaryTaken &&
-         player.dir.x===pointerNavigation.primary.x &&
-         player.dir.y===pointerNavigation.primary.y){
-        pointerNavigation.primaryTaken=true;
+      p.prevX=p.x;
+      p.prevY=p.y;
+      p.moveFromX=p.x;
+      p.moveFromY=p.y;
+      p.x=nx;
+      p.y=ny;
+      p.moveToX=nx;
+      p.moveToY=ny;
+      p.moveStartedAt=moveStartedAt;
+      p.moveDuration=playerMoveDelay(p,moveStartedAt)*PLAYER_SLIDE_RATIO;
+      checkSnakeContact(p);
+      checkWorldContact(p);
+      if(p.pointerNavigation && !p.pointerNavigation.primaryTaken &&
+         p.dir.x===p.pointerNavigation.primary.x &&
+         p.dir.y===p.pointerNavigation.primary.y){
+        p.pointerNavigation.primaryTaken=true;
       }
-      if(pointerNavigation &&
-         player.x===pointerNavigation.x &&
-         player.y===pointerNavigation.y){
-        pointerNavigation=null;
-        player.waitingForInput=false;
+      if(p.pointerNavigation &&
+         p.x===p.pointerNavigation.x &&
+         p.y===p.pointerNavigation.y){
+        p.pointerNavigation=null;
+        p.waitingForInput=false;
       }
     }
   }
 
-  function powerEatSnakeHead(s){
+  function powerEatSnakeHead(s,p){
     const snakeIndex=snakes.indexOf(s);
     if(snakeIndex<0 || !s.body.length) return false;
 
@@ -1446,6 +3069,7 @@ function makeSnake(x,y,len,dir) {
 
     if(!remaining.length){
       snakes.splice(snakeIndex,1);
+      AllyBrain.noteCompleted(p,s);
     }else{
       let newBody;
       let newDir;
@@ -1481,38 +3105,35 @@ function makeSnake(x,y,len,dir) {
         lastAngerTime:performance.now(),
         lastMemoryTick:s.lastMemoryTick||0,
         temperament:s.temperament,
+        threatByPlayer:[...(s.threatByPlayer||[0,0,0])],
         lastMove:0,
         turnBias:Math.random()
       };
+      provokeCreature(replacement,p,2,false);
       snakes.splice(snakeIndex,1,replacement);
+      AllyBrain.noteCompleted(p,s,replacement);
     }
 
     playSound('HeadEat');
-    score+=125;
-    updateHud();
+    awardPoints(p,125,remaining.length?2:1);
     if(snakes.length===0) nextLevel();
     return true;
   }
 
-  function checkSnakeContact() {
+  function checkSnakeContact(p) {
     for(let si=snakes.length-1;si>=0;si--) {
       const s=snakes[si];
-      const idx=s.body.findIndex(p=>p.x===player.x && p.y===player.y);
+      const idx=s.body.findIndex(cell=>cell.x===p.x && cell.y===p.y);
       if(idx<0) continue;
 
       if(idx===0) { // head
         const playerMove={
-          x:player.x-player.prevX,
-          y:player.y-player.prevY
+          x:p.x-p.prevX,
+          y:p.y-p.prevY
         };
 
-        if(spawnShieldIsBlocking()){
-          bumpPlayerBack();
-          return;
-        }
-
-        if(isPowerMode()){
-          powerEatSnakeHead(s);
+        if(isPowerMode(p)){
+          powerEatSnakeHead(s,p);
           return;
         }
 
@@ -1524,13 +3145,16 @@ function makeSnake(x,y,len,dir) {
             playerMove.y===-s.dir.y;
 
           if(frontalHit) {
-            loseLife();
+            // Spawn protection prevents death, but does not turn a frontal
+            // collision into a Power Mode bite.
+            if(isSpawnProtected(p)) bumpPlayerBack(p);
+            else loseLife(p);
           } else {
             // Side or rear contact: the player eats the solitary head.
             snakes.splice(si,1);
+            AllyBrain.noteCompleted(p,s);
             playSound('HeadEat');
-          score += 125;
-            updateHud();
+            awardPoints(p,125,0.75);
             if(snakes.length===0) nextLevel();
           }
         } else {
@@ -1542,12 +3166,16 @@ function makeSnake(x,y,len,dir) {
 
           if(sameDirection) {
             snakes.splice(si,1);
+            AllyBrain.noteCompleted(p,s);
             playSound('HeadEat');
-          score += 125;
-            updateHud();
+            awardPoints(p,125,0.75);
             if(snakes.length===0) nextLevel();
           } else {
-            loseLife();
+            // The shield is only invulnerability. Rear pursuit still eats
+            // normally above, while an unsafe angle merely pushes the player
+            // back until the three-second protection expires.
+            if(isSpawnProtected(p)) bumpPlayerBack(p);
+            else loseLife(p);
           }
         }
         return;
@@ -1582,14 +3210,17 @@ function makeSnake(x,y,len,dir) {
           s.angerPeak=Math.max(s.angerPeak||0,s.anger);
           s.angerFloor=Math.max(s.angerFloor||0,s.angerPeak*0.5);
           s.lastAngerTime=performance.now();
+          provokeCreature(s,p,1);
+          AllyBrain.noteTailBite(p,s);
           playRandomSound(BODY_EAT_SOUNDS);
-          score += 25;
+          awardPoints(p,25);
         } else {
           // Player is entering the single remaining head from behind:
           // the player eats it.
           snakes.splice(si,1);
+          AllyBrain.noteCompleted(p,s);
           playSound('HeadEat');
-          score += 125;
+          awardPoints(p,125,0.75);
         }
       } else { // middle: split into two snakes
         const front=s.body.slice(0,idx);
@@ -1613,6 +3244,7 @@ function makeSnake(x,y,len,dir) {
             lastAngerTime:s.lastAngerTime ?? 0,
             lastMemoryTick:s.lastMemoryTick ?? 0,
             temperament:s.temperament,
+            threatByPlayer:[...(s.threatByPlayer||[0,0,0])],
             lastMove:0,
             turnBias:Math.random()
           });
@@ -1654,6 +3286,7 @@ function makeSnake(x,y,len,dir) {
             lastAngerTime:s.lastAngerTime ?? 0,
             lastMemoryTick:s.lastMemoryTick ?? 0,
             temperament:s.temperament,
+            threatByPlayer:[...(s.threatByPlayer||[0,0,0])],
             lastMove:0,
             turnBias:Math.random()
           });
@@ -1665,12 +3298,15 @@ function makeSnake(x,y,len,dir) {
           part.angerFloor=Math.max(s.angerFloor||0,part.angerPeak*0.5);
           part.lastAngerTime=performance.now();
           part.temperament=s.temperament;
+          provokeCreature(part,p,2,false);
         });
+        p.aggressionContribution=(p.aggressionContribution||0)+2;
         snakes.splice(si,1,...created);
+        AllyBrain.noteSplit(p,s,created);
         playRandomSound(BODY_EAT_SOUNDS);
-        score += 10;
+        awardPoints(p,10);
       }
-      updateHud();
+      updateHud(p);
       if(snakes.length===0) nextLevel();
       return;
     }
@@ -1683,7 +3319,7 @@ function makeSnake(x,y,len,dir) {
 
   function scorpionSpawnTileIsClear(x,y){
     return !isWall(x,y) &&
-      !(player&&player.x===x&&player.y===y) &&
+      !allPlayers().some(p=>!p.dead&&p.x===x&&p.y===y) &&
       !occupiedBySnake(x,y) &&
       !occupiedByHunter(x,y) &&
       !eggs.some(e=>e.x===x&&e.y===y) &&
@@ -1737,7 +3373,7 @@ function makeSnake(x,y,len,dir) {
     };
   }
 
-  function killScorpion(t){
+  function killScorpion(t,p){
     if(!scorpion) return;
     playSound('ScorpioEat');
     scorpion=null;
@@ -1748,9 +3384,9 @@ function makeSnake(x,y,len,dir) {
     hunters.forEach(h=>{
       h.motherAlive=false;
       h.anger=Math.max(h.anger||0,0.95);
+      provokeCreature(h,p,3,false);
     });
-    score+=150;
-    updateHud();
+    awardPoints(p,150,3);
   }
 
   function moveScorpion(t){
@@ -1767,7 +3403,7 @@ function makeSnake(x,y,len,dir) {
       !isWall(x,y) &&
       !occupiedBySnake(x,y) &&
       !occupiedByHunter(x,y) &&
-      !(player.x===x && player.y===y) &&
+      !allPlayers().some(p=>!p.dead&&p.x===x&&p.y===y) &&
       !occupiedBySolidEgg(x,y,t);
 
     let options=dirs.filter(d=>{
@@ -1826,7 +3462,7 @@ function makeSnake(x,y,len,dir) {
         type:'egg',x:oldTailX,y:oldTailY,
         readyAt:t+(scorpion.snapMovement?0:scorpion.moveDuration)
       });
-      scorpion.nextEggAt=t+scaledEggDelay(30000,50000,t);
+      scorpion.nextEggAt=t+scaledRepeatEggDelay(30000,50000,t);
     }
   }
 
@@ -1892,7 +3528,8 @@ function makeSnake(x,y,len,dir) {
           moveStartedAt:t,
           moveDuration:hunterMoveDelay()*HUNTER_SLIDE_RATIO,
           motherAlive:true,
-          anger:0.45
+          anger:0.45,
+          threatByPlayer:[0,0,0]
         });
         eggs.splice(i,1);
       }
@@ -1938,11 +3575,12 @@ function makeSnake(x,y,len,dir) {
         h.mouthOpen=!h.mouthOpen;
       }
       h.lastMove=t;
-      if(h.x===player.x&&h.y===player.y){
-        if(spawnShieldIsBlocking(t)){
+      const victim=playerAt(h.x,h.y);
+      if(victim){
+        if(spawnShieldIsBlocking(victim,t)){
           h.x-=h.dir.x;
           h.y-=h.dir.y;
-        }else if(isPowerMode(t)){
+        }else if(isPowerMode(victim,t)){
           // Safety fallback for simultaneous movement: the hunter initiated
           // the contact, so it returns to its previous tile instead of being
           // awarded to the stationary player.
@@ -1950,7 +3588,7 @@ function makeSnake(x,y,len,dir) {
           h.y=oldY;
           h.dir={x:-h.dir.x,y:-h.dir.y};
         }
-        else loseLife();
+        else loseLife(victim);
       }
       h.moveFromX=oldX;
       h.moveFromY=oldY;
@@ -1963,92 +3601,104 @@ function makeSnake(x,y,len,dir) {
     });
   }
 
-  function checkWorldContact(){
+  function checkWorldContact(p){
     for(let i=fruits.length-1;i>=0;i--){
-      if(fruits[i].x===player.x&&fruits[i].y===player.y){
+      if(fruits[i].x===p.x&&fruits[i].y===p.y){
         playRandomSound(FRUIT_EAT_SOUNDS);
-        score += [50,100,150,200][fruits[i].kind] || 50;
+        awardPoints(p,[50,100,150,200][fruits[i].kind] || 50,0.35);
         fruits.splice(i,1);
-        activatePowerMode();
-        updateHud();
+        activatePowerMode(p);
       }
     }
 
-    if(scorpion&&((scorpion.x===player.x&&scorpion.y===player.y)||(scorpion.tailX===player.x&&scorpion.tailY===player.y))){
-      killScorpion(performance.now());
+    if(scorpion&&((scorpion.x===p.x&&scorpion.y===p.y)||(scorpion.tailX===p.x&&scorpion.tailY===p.y))){
+      killScorpion(performance.now(),p);
     }
 
-    const touchingHunter=hunters.find(h=>h.x===player.x&&h.y===player.y);
+    const touchingHunter=hunters.find(h=>h.x===p.x&&h.y===p.y);
     if(touchingHunter){
-      if(spawnShieldIsBlocking()) bumpPlayerBack();
-      else if(isPowerMode()) eatHunter(touchingHunter);
-      else loseLife();
+      if(spawnShieldIsBlocking(p)) bumpPlayerBack(p);
+      else if(isPowerMode(p)) eatHunter(touchingHunter,p);
+      else loseLife(p);
     }
   }
 
-  function loseLife() {
-    if(gameOver || player.dead) return;
-    pointerNavigation=null;
+  function loseLife(p) {
+    if(gameOver || !p || p.dead) return;
+    p.pointerNavigation=null;
     playSound('HeadDie');
     if(Math.random()<0.32) playSound('Oh_No');
-    powerModeUntil=0;
-    powerFlashBright=false;
-    spawnShieldUntil=0;
-    spawnFlashBright=false;
+    p.powerModeUntil=0;
+    p.powerFlashBright=false;
+    p.spawnShieldUntil=0;
+    p.spawnFlashBright=false;
 
-    // Losing a life strongly calms all surviving creatures.
+    // Losing a life calms the creatures specifically toward that player.
+    // Anger caused by the teammate remains intact.
     snakes.forEach(s=>{
-      s.anger=Math.max(0,(s.anger||0)*0.18);
-      s.angerPeak=Math.max(s.anger||0,(s.angerPeak||0)*0.35);
-      s.angerFloor=Math.min(s.angerFloor||0,(s.anger||0)*0.5);
+      if(!s.threatByPlayer) s.threatByPlayer=[0,0,0];
+      const oldPersonal=s.threatByPlayer[p.id-1]||0;
+      s.threatByPlayer[p.id-1]=oldPersonal*0.18;
+      s.anger=Math.max(0,(s.anger||0)-oldPersonal*0.55);
+      s.angerPeak=Math.max(s.anger||0,(s.angerPeak||0)*0.55);
+      s.angerFloor=Math.min(s.angerFloor||0,(s.anger||0)*0.6);
       s.lastAngerTime=performance.now();
     });
     hunters.forEach(h=>{
-      h.anger=0.15;
-      h.motherAlive=true;
+      if(!h.threatByPlayer) h.threatByPlayer=[0,0,0];
+      h.threatByPlayer[p.id-1]=(h.threatByPlayer[p.id-1]||0)*0.18;
+      h.anger=Math.max(0.15,(h.anger||0)*0.65);
     });
 
-    lives--;
-    player.dead=true;
-    player.hideDeathSprite=false;
-    player.deathX=player.x;
-    player.deathY=player.y;
-    player.deathStartedAt=performance.now();
-    player.respawnAt=player.deathStartedAt+3000;
-    updateHud();
+    p.lives--;
+    p.dead=true;
+    p.hideDeathSprite=false;
+    p.deathX=p.x;
+    p.deathY=p.y;
+    p.deathStartedAt=performance.now();
+    p.respawnAt=p.deathStartedAt+3000;
+    updateHud(p);
   }
 
-  function updatePlayerDeath(t){
-    if(!player.dead || t<player.respawnAt) return;
+  function updatePlayerDeath(p,t){
+    if(!p.dead || t<p.respawnAt) return;
 
-    if(lives<=0){
-      player.dead=false;
-      gameOver=true;
-      playSound('Game_Over');
+    if(p.lives<=0){
+      p.eliminated=true;
+      p.hideDeathSprite=true;
+      if(!gameOver && allPlayers().every(candidate=>candidate.lives<=0)){
+        gameOver=true;
+        playSound('Game_Over');
+      }
       return;
     }
 
-    if(!playerStartIsClear()){
-      player.hideDeathSprite=true;
+    if(!playerStartIsClear(p)){
+      p.hideDeathSprite=true;
       return;
     }
 
-    player=createPlayerAtStart();
-    lastPlayerMouthAt=t;
-    activateSpawnShield(t);
+    const replacement=createPlayerAtStart(p);
+    setPlayerReference(replacement);
+    activateSpawnShield(replacement,t);
   }
 
   function nextLevel() {
     playSound('Congratulations');
-    pointerNavigation=null;
     level++;
-    powerModeUntil=0;
-    powerFlashBright=false;
-    score += 500;
-    player=createPlayerAtStart();
+    applyMazeForLevel(level);
+    allPlayers().forEach(p=>awardPoints(p,500));
+    // Keep a trace of each player's notoriety, but give every teammate room to
+    // change the inhabitants' attention on the new level.
+    allPlayers().forEach(p=>{
+      p.aggressionContribution=(p.aggressionContribution||0)*0.35;
+      const replacement=p.lives>0
+        ? createPlayerAtStart(p)
+        : {...p,dead:true,eliminated:true,hideDeathSprite:true};
+      setPlayerReference(replacement);
+    });
     spawnSnakesForLevel();
-    lastPlayerMouthAt=performance.now();
-    activateSpawnShield();
+    allPlayers().filter(p=>!p.dead).forEach(p=>activateSpawnShield(p));
     fruits=[];
     eggs=[];
     pendingScorpionDrops=[];
@@ -2199,7 +3849,7 @@ function makeSnake(x,y,len,dir) {
     const nx=g.x+chosen.x, ny=g.y+chosen.y;
 
     // The invisible tail guide must not pass through the player.
-    if(nx===player.x && ny===player.y){
+    if(playerAt(nx,ny)){
       // Signal that the player blocked the tail-led retreat.
       return "player-blocked";
     }
@@ -2272,8 +3922,9 @@ function makeSnake(x,y,len,dir) {
           const chosen=chooseForwardDirection(s,newBranches,h);
           const wasAlreadyFacingChosen=
             s.dir.x===chosen.x && s.dir.y===chosen.y;
-          const chosenLeadsIntoPlayer=
-            h.x+chosen.x===player.x && h.y+chosen.y===player.y;
+          const chosenLeadsIntoPlayer=!!playerAt(
+            h.x+chosen.x,h.y+chosen.y
+          );
           s.reversing=false;
           s.blockedDir=null;
           s.reverseSteps=0;
@@ -2289,7 +3940,7 @@ function makeSnake(x,y,len,dir) {
             s.body[0]={x:h.x+chosen.x,y:h.y+chosen.y};
           }
         } else if(previous &&
-                  !(previous.x===player.x && previous.y===player.y) &&
+                  !playerAt(previous.x,previous.y) &&
                   canEnter(previous.x,previous.y,s,true)) {
           s.headTrail.pop();
 
@@ -2310,8 +3961,9 @@ function makeSnake(x,y,len,dir) {
             const chosen=chooseForwardDirection(s,forward);
             const wasAlreadyFacingChosen=
               s.dir.x===chosen.x && s.dir.y===chosen.y;
-            const chosenLeadsIntoPlayer=
-              h.x+chosen.x===player.x && h.y+chosen.y===player.y;
+            const chosenLeadsIntoPlayer=!!playerAt(
+              h.x+chosen.x,h.y+chosen.y
+            );
             s.reversing=false;
             s.blockedDir=null;
             s.reverseSteps=0;
@@ -2347,13 +3999,24 @@ function makeSnake(x,y,len,dir) {
         }
       }
 
-      if(s.body[0].x===player.x && s.body[0].y===player.y) {
+      const victim=playerAt(s.body[0].x,s.body[0].y);
+      if(victim) {
         const actuallyMoved =
           s.body[0].x!==oldHeadPosition.x ||
           s.body[0].y!==oldHeadPosition.y;
 
-        if(isPowerMode()){
-          powerEatSnakeHead(s);
+        if(isPowerMode(victim)){
+          powerEatSnakeHead(s,victim);
+        } else if(isSpawnProtected(victim)) {
+          // A protected player is an obstacle, not a powered predator.
+          // Restore the solitary head to its pre-move tile.
+          s.body[0]={...oldHeadPosition};
+          if(s.headTrail?.length){
+            const last=s.headTrail[s.headTrail.length-1];
+            if(last.x===oldHeadPosition.x&&last.y===oldHeadPosition.y)
+              s.headTrail.pop();
+          }
+          s.lastMove=0;
         } else if(s.reversing && actuallyMoved) {
           // Rear of the head touched the player:
           // stop reversing and immediately resume forward behaviour.
@@ -2362,7 +4025,7 @@ function makeSnake(x,y,len,dir) {
           s.lastMove=0;
           // Keep the player alive and in place.
         } else {
-          loseLife();
+          loseLife(victim);
         }
       }
       return;
@@ -2477,48 +4140,63 @@ function makeSnake(x,y,len,dir) {
       }
     }
 
-    if(s.body[0].x===player.x && s.body[0].y===player.y) {
-      if(isPowerMode()){
-        powerEatSnakeHead(s);
+    const victim=playerAt(s.body[0].x,s.body[0].y);
+    if(victim) {
+      if(isPowerMode(victim)){
+        powerEatSnakeHead(s,victim);
+      }else if(isSpawnProtected(victim)){
+        // This is a rare simultaneous-movement fallback; ordinary pathing
+        // already treats the protected player as a solid obstacle.
+        bumpPlayerBack(victim);
       }else{
         // Snake moved into the player: the snake eats the player.
-        loseLife();
+        loseLife(victim);
       }
     }
   }
 
   function updateSnakeMemory(s,t){
-    if(!s.lastAngerTime || (s.anger||0)<=0) return;
+    if(!s.lastAngerTime) return;
 
     // Start calming down after a random-feeling 20-30 second grace period.
     const calmDelay = 20000 + ((s.temperament||0.5) * 10000);
     if(t - s.lastAngerTime < calmDelay) return;
 
+    const elapsed=t-(s.lastMemoryTick||t);
     const floor = Math.max(0, s.angerFloor || 0);
     if(s.anger > floor){
       // Slow continuous decay; about 1 anger point per 18 seconds.
-      s.anger = Math.max(floor, s.anger - 0.000055 * (t - (s.lastMemoryTick||t)));
+      s.anger = Math.max(floor, s.anger - 0.000055 * elapsed);
+    }
+    if(s.threatByPlayer){
+      // Personal grudges also fade, independently for the two players.
+      s.threatByPlayer=s.threatByPlayer.map(value=>
+        Math.max(0,(value||0)-0.000035*elapsed)
+      );
     }
     s.lastMemoryTick=t;
   }
 
   function update(t) {
-    if(gameOver||paused) return;
+    if(gameOver||paused||awaitingPlayerSelection) return;
 
-    updatePlayerDeath(t);
-    updatePowerMode(t);
-    updateSpawnShield(t);
+    allPlayers().forEach(p=>updatePlayerDeath(p,t));
+    allPlayers().forEach(p=>{
+      updatePowerMode(p,t);
+      updateSpawnShield(p,t);
 
-    if(!player.dead && t-lastPlayerMouthAt>=170){
-      player.mouthOpen=!player.mouthOpen;
-      lastPlayerMouthAt=t;
-    }
+      if(!p.dead && t-p.lastMouthAt>=170){
+        p.mouthOpen=!p.mouthOpen;
+        p.lastMouthAt=t;
+      }
 
-    const playerDelay=playerMoveDelay(t);
-    if(!player.dead && t-lastMove>playerDelay) {
-      advancePlayer();
-      lastMove=t;
-    }
+      const delay=playerMoveDelay(p,t);
+      if(!p.dead && t-p.lastMove>delay){
+        if(p.isAI) AllyBrain.plan(p,t);
+        advancePlayer(p);
+        p.lastMove=t;
+      }
+    });
     MazeBrain.update(t);
     const snakeDelay=snakeMoveDelay();
     snakes.forEach(s => {
@@ -2810,6 +4488,7 @@ function drawSnakeHead(px,py,dir) {
     if(!image || !image.complete || !image.naturalWidth) return false;
     ctx.save();
     ctx.imageSmoothingEnabled=false;
+    ctx.filter=mazeColorTheme.filter;
     ctx.translate(x*TILE+TILE/2,y*TILE+TILE/2);
     ctx.rotate(quarterTurns*Math.PI/2);
     ctx.drawImage(image,-TILE/2,-TILE/2,TILE,TILE);
@@ -2827,11 +4506,11 @@ function drawSnakeHead(px,py,dir) {
     // receive a direct 180° calibration.
     if(isCorner && drawMazeSpriteRotated(sprite,x,y,1)) return;
     if(isEnd && drawMazeSpriteRotated(sprite,x,y,2)) return;
-    if(drawOriginalSprite(sprite,x,y)) return;
+    if(drawOriginalSprite(sprite,x,y,mazeColorTheme.filter)) return;
 
     // Safe fallback while the embedded bitmap is still loading.
-    rect(x*TILE,y*TILE,TILE,TILE,'#1737c7');
-    rect(x*TILE+3,y*TILE+3,TILE-6,TILE-6,'#071263');
+    rect(x*TILE,y*TILE,TILE,TILE,mazeColorTheme.fallbackOuter);
+    rect(x*TILE+3,y*TILE+3,TILE-6,TILE-6,mazeColorTheme.fallbackInner);
   }
 
   function draw() {
@@ -2945,38 +4624,73 @@ function drawSnakeHead(px,py,dir) {
     drawScorpion();
     hunters.forEach(drawHunter);
 
-    if(player.dead){
-      if(!player.hideDeathSprite){
-        const deadSprite=OriginalSprites.DeadHead;
-        ctx.save();
-        ctx.globalAlpha=deathSkeletonPulseAlpha(player);
-        if(!drawOriginalSprite(deadSprite,player.deathX,player.deathY)){
-          rect(player.deathX*TILE+4,player.deathY*TILE+4,12,12,'#ddd');
+    allPlayers().forEach(p=>{
+      if(p.dead){
+        if(!p.hideDeathSprite){
+          const deadSprite=OriginalSprites.DeadHead;
+          const deadFilter=p.isAI
+            ? 'hue-rotate(70deg) saturate(1.6) brightness(1.1)'
+            : p.id===2
+              ? 'hue-rotate(190deg) saturate(1.7)'
+              : 'none';
+          ctx.save();
+          ctx.globalAlpha=deathSkeletonPulseAlpha(p);
+          if(!drawOriginalSprite(deadSprite,p.deathX,p.deathY,deadFilter)){
+            const deadColor=p.isAI?'#ffd85d':p.id===2?'#78bfff':'#ddd';
+            rect(p.deathX*TILE+4,p.deathY*TILE+4,12,12,deadColor);
+          }
+          ctx.restore();
         }
-        ctx.restore();
+      }else{
+        drawPlayer(p);
       }
-    }else{
-      drawPlayer(player);
-    }
+    });
 
-    if(paused) overlay('PAUSE');
-    if(gameOver) overlay('GAME OVER', 'R - NEW GAME');
+    if(awaitingPlayerSelection)
+      overlay('SELECT GAME','1 SOLO   2 DUO','3 SOLO AI   4 DUO AI');
+    else if(paused) overlay('PAUSE');
+    if(gameOver) overlay('GAME OVER','1 SOLO   2 DUO','3 SOLO AI   4 DUO AI');
   }
 
 
   function drawPlayer(p){
     const sprite=originalCharacterSprite('Head',p.dir,p.mouthOpen);
-    const visual=playerVisualPosition();
+    const visual=playerVisualPosition(p);
+    const rivals=teammatesOf(p);
+    const leading=rivals.length&&rivals.every(rival=>p.score>rival.score);
+
+    if(leading){
+      const cx=(visual.x+0.5)*TILE;
+      const cy=(visual.y+0.5)*TILE;
+      ctx.save();
+      ctx.globalAlpha=0.62+0.16*Math.sin(performance.now()/420);
+      ctx.strokeStyle='#ffe36e';
+      ctx.lineWidth=1.5;
+      ctx.shadowColor='#ffd84a';
+      ctx.shadowBlur=8;
+      ctx.beginPath();
+      ctx.arc(cx,cy,TILE*0.61,0,Math.PI*2);
+      ctx.stroke();
+      ctx.restore();
+    }
+
     const bright=
-      (isPowerMode() && powerFlashBright) ||
-      (isSpawnProtected() && spawnFlashBright);
-    const filter=bright
+      (isPowerMode(p) && p.powerFlashBright) ||
+      (isSpawnProtected(p) && p.spawnFlashBright);
+    const tint=p.isAI
+      ? 'hue-rotate(70deg) saturate(1.65) brightness(1.10)'
+      : p.id===2
+        ? 'hue-rotate(190deg) saturate(1.75) brightness(1.08)'
+        : '';
+    const power=bright
       ? 'brightness(1.85) saturate(1.7) drop-shadow(0 0 2px #fff)'
-      : 'none';
+      : '';
+    const filter=[tint,power].filter(Boolean).join(' ')||'none';
     if(drawOriginalSprite(sprite,visual.x,visual.y,filter)) return;
 
     // Safe fallback while an embedded image is still loading.
-    rect(visual.x*TILE+5,visual.y*TILE+5,10,10,bright?'#ffff7a':'#fff');
+    const base=p.isAI?'#ffd85d':p.id===2?'#66baff':'#fff';
+    rect(visual.x*TILE+5,visual.y*TILE+5,10,10,bright?'#ffff7a':base);
   }
 
   function strongPulseAlpha(t=performance.now()){
@@ -2989,19 +4703,20 @@ function drawSnakeHead(px,py,dir) {
     return 0.55+0.45*Math.cos(elapsed/310);
   }
 
-  function overlay(a,b='') {
+  function overlay(a,b='',c='') {
     ctx.fillStyle='rgba(0,0,0,.82)';
-    ctx.fillRect(56,136,400,104);
+    ctx.fillRect(48,c?124:136,416,c?136:104);
 
     // Faster, deeper fade-out/fade-in pulse. Opacity still remains above zero.
-    const shouldPulse=a==='GAME OVER'||a==='PAUSE';
+    const shouldPulse=a==='GAME OVER'||a==='PAUSE'||a==='SELECT GAME';
     const pulse=shouldPulse
       ? strongPulseAlpha()
       : 1;
     ctx.save();
     ctx.globalAlpha=pulse;
-    drawBitmapText(ctx,a,256,160,{scale:1.5,align:'center'});
-    if(b) drawBitmapText(ctx,b,256,208,{scale:1,align:'center'});
+    drawBitmapText(ctx,a,256,c?144:160,{scale:c?1.25:1.5,align:'center'});
+    if(b) drawBitmapText(ctx,b,256,c?190:208,{scale:1,align:'center'});
+    if(c) drawBitmapText(ctx,c,256,222,{scale:1,align:'center'});
     ctx.restore();
   }
 
@@ -3012,39 +4727,72 @@ function drawSnakeHead(px,py,dir) {
     keys[k]=true;
     if(['ArrowUp','ArrowDown','ArrowLeft','ArrowRight',' '].includes(e.key)) e.preventDefault();
 
-    if(k==='ArrowLeft' || k==='a') setPlayerDirection(-1,0);
-    else if(k==='ArrowRight' || k==='d') setPlayerDirection(1,0);
-    else if(k==='ArrowUp' || k==='w') setPlayerDirection(0,-1);
-    else if(k==='ArrowDown' || k==='s') setPlayerDirection(0,1);
-    else if(k==='p') paused=!paused;
-    else if(k==='r'){
-      reset(true);
+    if(k==='1'){
+      startNewGame(1);
+      return;
     }
+    if(k==='2'){
+      startNewGame(2);
+      return;
+    }
+    if(k==='3'){
+      startNewGame(3);
+      return;
+    }
+    if(k==='4'){
+      startNewGame(4);
+      return;
+    }
+    if(awaitingPlayerSelection||gameOver) return;
+
+    if(k==='a') setPlayerDirection(player,-1,0);
+    else if(k==='d') setPlayerDirection(player,1,0);
+    else if(k==='w') setPlayerDirection(player,0,-1);
+    else if(k==='s') setPlayerDirection(player,0,1);
+    else if(k==='ArrowLeft')
+      setPlayerDirection(humanPlayerCount===2?player2:player,-1,0);
+    else if(k==='ArrowRight')
+      setPlayerDirection(humanPlayerCount===2?player2:player,1,0);
+    else if(k==='ArrowUp')
+      setPlayerDirection(humanPlayerCount===2?player2:player,0,-1);
+    else if(k==='ArrowDown')
+      setPlayerDirection(humanPlayerCount===2?player2:player,0,1);
+    else if(k==='p') paused=!paused;
   });
   addEventListener('keyup',e=>{keys[e.key.length===1?e.key.toLowerCase():e.key]=false;});
 
   function setDirectionFromPointer(e){
-    if(gameOver||paused||player.dead) return;
+    if(gameOver||paused||awaitingPlayerSelection) return;
     const bounds=canvas.getBoundingClientRect();
     const pointerX=(e.clientX-bounds.left)*(canvas.width/bounds.width);
     const pointerY=(e.clientY-bounds.top)*(canvas.height/bounds.height);
-    const visual=playerVisualPosition();
+    const candidates=livingHumanPlayers();
+    if(!candidates.length) return;
+    const p=candidates.slice().sort((a,b)=>{
+      const av=playerVisualPosition(a),bv=playerVisualPosition(b);
+      const ad=(pointerX-(av.x+0.5)*TILE)**2+
+        (pointerY-(av.y+0.5)*TILE)**2;
+      const bd=(pointerX-(bv.x+0.5)*TILE)**2+
+        (pointerY-(bv.y+0.5)*TILE)**2;
+      return ad-bd;
+    })[0];
+    const visual=playerVisualPosition(p);
     const playerCenterX=(visual.x+0.5)*TILE;
     const playerCenterY=(visual.y+0.5)*TILE;
     const dx=pointerX-playerCenterX;
     const dy=pointerY-playerCenterY;
     const targetX=Math.max(0,Math.min(COLS-1,Math.floor(pointerX/TILE)));
     const targetY=Math.max(0,Math.min(ROWS-1,Math.floor(pointerY/TILE)));
-    const horizontal=targetX===player.x
+    const horizontal=targetX===p.x
       ? null
-      : {x:targetX>player.x?1:-1,y:0};
-    const vertical=targetY===player.y
+      : {x:targetX>p.x?1:-1,y:0};
+    const vertical=targetY===p.y
       ? null
-      : {x:0,y:targetY>player.y?1:-1};
+      : {x:0,y:targetY>p.y?1:-1};
 
     if(!horizontal&&!vertical){
-      pointerNavigation=null;
-      player.waitingForInput=false;
+      p.pointerNavigation=null;
+      p.waitingForInput=false;
       return;
     }
 
@@ -3052,7 +4800,7 @@ function drawSnakeHead(px,py,dir) {
     const directions=horizontalFirst
       ? [horizontal,vertical]
       : [vertical,horizontal];
-    pointerNavigation={
+    p.pointerNavigation={
       x:targetX,
       y:targetY,
       directions:directions.filter(Boolean),
@@ -3061,13 +4809,13 @@ function drawSnakeHead(px,py,dir) {
       primaryTaken:false
     };
 
-    const firstStep=pointerNavigationStep();
+    const firstStep=pointerNavigationStep(p);
     if(firstStep){
-      player.nextDir={...firstStep};
-      player.waitingForInput=false;
+      p.nextDir={...firstStep};
+      p.waitingForInput=false;
     }else{
-      player.nextDir={...player.dir};
-      player.waitingForInput=false;
+      p.nextDir={...p.dir};
+      p.waitingForInput=false;
     }
   }
 
@@ -3076,9 +4824,10 @@ function drawSnakeHead(px,py,dir) {
     setDirectionFromPointer(e);
   });
 
-  document.getElementById('restart').onclick=()=>{
-    reset(true);
-  };
+  document.getElementById('onePlayer').onclick=()=>startNewGame(1);
+  document.getElementById('twoPlayers').onclick=()=>startNewGame(2);
+  document.getElementById('onePlayerAi').onclick=()=>startNewGame(3);
+  document.getElementById('twoPlayersAi').onclick=()=>startNewGame(4);
 
   reset(true);
   requestAnimationFrame(loop);
