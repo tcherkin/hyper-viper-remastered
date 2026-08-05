@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Hyper Viper Remastered v0.99.47.9 - Exact Mode Columns</title>
+<title>Hyper Viper Remastered v0.99.48.1 - Tail Reverse Brain</title>
 <style>
   :root { --px: 3px; }
   * { box-sizing: border-box; }
@@ -55,12 +55,13 @@
 <body>
 <div class="wrap">
   <h1>HYPER VIPER</h1>
-  <div class="sub">Remastered v0.99.47.9 - Exact Mode Columns</div>
+  <div class="sub">Remastered v0.99.48.1 - Tail Reverse Brain</div>
   <canvas class="bitmap-hud" id="bitmapHud" width="512" height="32" aria-label="Player scores, lives, vipers and level"></canvas>
   <canvas id="game" width="512" height="384" aria-label="Hyper Viper game"></canvas>
   <div class="help">
     SELECT 0-4 TO START. DURING PLAY TYPE 01-99, OR 00 FOR LEVEL 100.<br>
-    P1: WASD. P2: ARROWS. SOLO ALSO USES ARROWS. P: PAUSE.
+    P1: WASD. P2: ARROWS. HOLD TWO DIRECTIONS TO CLIMB DIAGONALS.<br>
+    CLICK OR TAP FOR SHORTEST ROUTE. P: PAUSE.
   </div>
   <div class="mode-controls" aria-label="Game mode selection">
     <button class="ai-only" id="aiOnly">0 AI ONLY</button>
@@ -2556,7 +2557,43 @@
       return choice.d;
     }
 
-    return {update,choose,aggression};
+    // Human pointer navigation uses the same exact maze-distance fields as
+    // the inhabitants. The resolved target may be beside a clicked wall, and
+    // each step remains a true shortest-path step around walls and solid eggs.
+    function resolveRouteTarget(target,t=performance.now()){
+      return nearestRouteTile(target,t);
+    }
+
+    function routeDistance(from,target,t=performance.now()){
+      if(!from||from.x<0||from.y<0||from.x>=COLS||from.y>=ROWS)
+        return Infinity;
+      const safeTarget=nearestRouteTile(target,t);
+      const distance=fieldFor(safeTarget,t)[index(from.x,from.y)];
+      return distance<0?Infinity:distance;
+    }
+
+    function routeStep(entity,target,t=performance.now()){
+      const safeTarget=nearestRouteTile(target,t);
+      if(entity.x===safeTarget.x&&entity.y===safeTarget.y) return null;
+      const field=fieldFor(safeTarget,t);
+      const candidates=dirs.map(d=>{
+        const x=entity.x+d.x,y=entity.y+d.y;
+        if(isWall(x,y)||occupiedBySolidEgg(x,y,t)||teammateAt(entity,x,y))
+          return null;
+        const distance=field[index(x,y)];
+        if(distance<0) return null;
+        const straight=entity.dir&&d.x===entity.dir.x&&d.y===entity.dir.y;
+        return {d,distance,straight};
+      }).filter(Boolean).sort((a,b)=>
+        a.distance-b.distance || Number(b.straight)-Number(a.straight)
+      );
+      return candidates.length?{...candidates[0].d}:null;
+    }
+
+    return {
+      update,choose,aggression,
+      resolveRouteTarget,routeDistance,routeStep
+    };
   })();
 
   // Dedicated snake-hunter intelligence for the optional AI player. It keeps
@@ -4007,6 +4044,8 @@
       aiFruitTarget:null,aiObservedX:null,aiObservedY:null,
       aiRunDirection:null,aiRunLength:0,
       pointerNavigation:null,
+      keyboardHeldKeys:Object.create(null),
+      keyboardAlternateLast:null,
       powerModeUntil:0,powerFlashBright:false,lastPowerFlashAt:0,
       spawnShieldUntil:0,spawnFlashBright:false,lastSpawnFlashAt:0,
       lastMove:0,lastMouthAt:now,
@@ -4871,80 +4910,130 @@ function makeSnake(x,y,len,dir) {
     awardPoints(p,200,0.5);
   }
 
-  function setPlayerDirection(p,dx,dy) {
-    if(gameOver||paused||p.dead) return;
+  let keyboardPressSerial=0;
+  const KEYBOARD_DIRECTIONS={
+    a:{x:-1,y:0},d:{x:1,y:0},w:{x:0,y:-1},s:{x:0,y:1},
+    ArrowLeft:{x:-1,y:0},ArrowRight:{x:1,y:0},
+    ArrowUp:{x:0,y:-1},ArrowDown:{x:0,y:1}
+  };
+
+  function sameDirection(a,b){
+    return !!a&&!!b&&a.x===b.x&&a.y===b.y;
+  }
+
+  function keyboardPlayerForKey(key){
+    if(gameMode===0) return null;
+    if(['a','d','w','s'].includes(key)) return player;
+    if(key.startsWith('Arrow'))
+      return humanPlayerCount===2?player2:player;
+    return null;
+  }
+
+  function heldKeyboardDirections(p){
+    if(!p?.keyboardHeldKeys) return [];
+    const ordered=Object.entries(p.keyboardHeldKeys)
+      .map(([key,value])=>({key,...value}))
+      .sort((a,b)=>b.order-a.order);
+    const unique=[];
+    for(const item of ordered){
+      if(unique.some(other=>sameDirection(other.dir,item.dir))) continue;
+      unique.push(item);
+      if(unique.length===2) break;
+    }
+    return unique;
+  }
+
+  function pressKeyboardDirection(key){
+    const p=keyboardPlayerForKey(key);
+    const dir=KEYBOARD_DIRECTIONS[key];
+    if(!p||!dir||gameOver||paused||p.dead) return;
     p.pointerNavigation=null;
-    p.nextDir={x:dx,y:dy};
+    if(!p.keyboardHeldKeys[key]){
+      const previouslyHeld=heldKeyboardDirections(p);
+      p.keyboardHeldKeys[key]={dir:{...dir},order:++keyboardPressSerial};
+      const previousDifferent=previouslyHeld.find(item=>
+        !sameDirection(item.dir,dir)
+      );
+      // Make the newly pressed second direction the first requested turn.
+      p.keyboardAlternateLast=previousDifferent
+        ? {...previousDifferent.dir}
+        : {...dir};
+    }
+    p.nextDir={...dir};
     p.waitingForInput=false;
   }
 
-  function pointerNavigationStep(p){
+  function releaseKeyboardDirection(key){
+    for(const p of allPlayers()){
+      if(!p?.keyboardHeldKeys?.[key]) continue;
+      delete p.keyboardHeldKeys[key];
+      const remaining=heldKeyboardDirections(p);
+      if(remaining.length<2)
+        p.keyboardAlternateLast=remaining.length
+          ? {...remaining[0].dir}
+          : null;
+    }
+  }
+
+  function clearPlayerKeyboardControl(p){
+    p.keyboardHeldKeys=Object.create(null);
+    p.keyboardAlternateLast=null;
+  }
+
+  function keyboardNavigationStep(p,t=performance.now()){
+    const held=heldKeyboardDirections(p);
+    if(!held.length) return null;
+    if(held.length===1) return {...held[0].dir};
+
+    const first=held[0].dir,second=held[1].dir;
+    // Opposite keys on one axis are not a staircase pair. The newest key wins.
+    if((first.x!==0&&second.x!==0)||(first.y!==0&&second.y!==0))
+      return {...first};
+
+    const directionIsOpen=d=>{
+      const x=p.x+d.x,y=p.y+d.y;
+      return !isWall(x,y)&&!occupiedBySolidEgg(x,y,t)&&
+        !teammateAt(p,x,y);
+    };
+    const preferred=sameDirection(p.keyboardAlternateLast,first)
+      ? second
+      : first;
+    const alternate=sameDirection(preferred,first)?second:first;
+
+    if(directionIsOpen(preferred)){
+      p.keyboardAlternateLast={...preferred};
+      return {...preferred};
+    }
+    if(directionIsOpen(alternate)){
+      p.keyboardAlternateLast={...alternate};
+      return {...alternate};
+    }
+    // Keep the next alternating turn queued while momentum carries the player
+    // to the first cell at which that direction becomes possible.
+    return {...preferred};
+  }
+
+  function pointerNavigationStep(p,t=performance.now()){
     if(!p.pointerNavigation) return null;
     const target=p.pointerNavigation;
     if(p.x===target.x&&p.y===target.y) return null;
-
-    const directionIsOpen=d=>{
-      if(!d) return false;
-      const nx=p.x+d.x,ny=p.y+d.y;
-      return !isWall(nx,ny)&&!occupiedBySolidEgg(nx,ny)&&
-        !teammateAt(p,nx,ny);
-    };
-
-    // Until the preferred axis has actually been entered, preserve momentum.
-    // This lets a moving player scan along a corridor for the first requested
-    // turn instead of stopping or immediately reversing toward the secondary.
-    if(!target.primaryTaken){
-      if(directionIsOpen(target.primary)) return target.primary;
-      if(directionIsOpen(p.dir)) return {...p.dir};
-      if(directionIsOpen(target.secondary)) return target.secondary;
-      return null;
-    }
-
-    const queue=[{x:p.x,y:p.y,first:null}];
-    const visited=new Set([`${p.x},${p.y}`]);
-    let best=queue[0];
-    let bestDistance=
-      Math.abs(p.x-target.x)+Math.abs(p.y-target.y);
-
-    for(let q=0;q<queue.length;q++){
-      const node=queue[q];
-      if(node.x===target.x&&node.y===target.y) return node.first;
-
-      for(const d of target.directions){
-        const nx=node.x+d.x,ny=node.y+d.y;
-        // Stay inside the rectangle between the player and the selected tile;
-        // no third direction, reversal or overshooting is ever permitted.
-        if(d.x>0&&nx>target.x || d.x<0&&nx<target.x ||
-           d.y>0&&ny>target.y || d.y<0&&ny<target.y) continue;
-        if(isWall(nx,ny)||occupiedBySolidEgg(nx,ny)) continue;
-        const key=`${nx},${ny}`;
-        if(visited.has(key)) continue;
-        visited.add(key);
-
-        const first=node.first||d;
-        const next={x:nx,y:ny,first};
-        queue.push(next);
-        const distance=Math.abs(nx-target.x)+Math.abs(ny-target.y);
-        if(distance<bestDistance){
-          best=next;
-          bestDistance=distance;
-        }
-      }
-    }
-
-    // If the exact tile is blocked, approach the nearest reachable tile using
-    // only the two directions selected by the original click.
-    return best.first;
+    return MazeBrain.routeStep(p,target,t);
   }
 
   function advancePlayer(p) {
     if(gameOver||paused||p.dead) return;
 
-    if(p.pointerNavigation){
+    const now=performance.now();
+    const keyboardDirection=!p.isAI?keyboardNavigationStep(p,now):null;
+    if(keyboardDirection){
+      p.pointerNavigation=null;
+      p.nextDir={...keyboardDirection};
+      p.waitingForInput=false;
+    }else if(p.pointerNavigation){
       if(p.x===p.pointerNavigation.x&&p.y===p.pointerNavigation.y){
         p.pointerNavigation=null;
       }
-      const routeDirection=pointerNavigationStep(p);
+      const routeDirection=pointerNavigationStep(p,now);
       if(!routeDirection){
         // A click never applies the brakes. Keep the current momentum while
         // waiting for one of the requested directions to become available.
@@ -4965,7 +5054,7 @@ function makeSnake(x,y,len,dir) {
     const nx=p.x+p.dir.x, ny=p.y+p.dir.y;
     const eggBlocked = occupiedBySolidEgg(nx,ny);
     if(!isWall(nx,ny) && !eggBlocked && !teammateAt(p,nx,ny)) {
-      const moveStartedAt=performance.now();
+      const moveStartedAt=now;
       p.prevX=p.x;
       p.prevY=p.y;
       p.moveFromX=p.x;
@@ -4978,11 +5067,6 @@ function makeSnake(x,y,len,dir) {
       p.moveDuration=playerMoveDelay(p,moveStartedAt)*PLAYER_SLIDE_RATIO;
       checkSnakeContact(p);
       checkWorldContact(p);
-      if(p.pointerNavigation && !p.pointerNavigation.primaryTaken &&
-         p.dir.x===p.pointerNavigation.primary.x &&
-         p.dir.y===p.pointerNavigation.primary.y){
-        p.pointerNavigation.primaryTaken=true;
-      }
       if(p.pointerNavigation &&
          p.x===p.pointerNavigation.x &&
          p.y===p.pointerNavigation.y){
@@ -5748,6 +5832,94 @@ function makeSnake(x,y,len,dir) {
       y:tail.y,
       dir:{x:tail.x-beforeTail.x,y:tail.y-beforeTail.y}
     };
+    // The invisible leader remembers where it has already searched. This is
+    // separate from the visible body because old cells gradually become free
+    // and would otherwise tempt the tail into the same loop again.
+    s.tailGuideHistory=[{x:tail.x,y:tail.y}];
+    s.tailGuideFailures=0;
+  }
+
+  function tailSearchCellOpen(x,y,s,blockedBody) {
+    const key=`${x},${y}`;
+    return !isWall(x,y)
+      && !blockedBody.has(key)
+      && !occupiedByOtherSnake(x,y,s)
+      && !occupiedByScorpion(x,y)
+      && !occupiedByHunter(x,y)
+      && !occupiedBySolidEgg(x,y)
+      && !playerRepelsInhabitant(x,y);
+  }
+
+  function tailRetreatOptionScore(s,g,option) {
+    const nx=g.x+option.x,ny=g.y+option.y;
+    const blockedBody=new Set(s.body.map(cell=>`${cell.x},${cell.y}`));
+    // Keep the current tail closed during the search. Otherwise two branches
+    // appear connected through the cell from which the guide is choosing.
+    blockedBody.add(`${g.x},${g.y}`);
+    blockedBody.delete(`${nx},${ny}`);
+
+    const recentCounts=new Map();
+    for(const cell of s.tailGuideHistory||[]){
+      const key=`${cell.x},${cell.y}`;
+      recentCounts.set(key,(recentCounts.get(key)||0)+1);
+    }
+
+    const startKey=`${nx},${ny}`;
+    const visited=new Map([[startKey,0]]);
+    const queue=[{x:nx,y:ny,depth:0}];
+    let maxDepth=0;
+    let junctions=0;
+    let recentTouches=recentCounts.get(startKey)||0;
+    const SEARCH_LIMIT=192;
+
+    for(let read=0;read<queue.length&&read<SEARCH_LIMIT;read++){
+      const cell=queue[read];
+      maxDepth=Math.max(maxDepth,cell.depth);
+      let exits=0;
+      for(const d of dirs){
+        const x=cell.x+d.x,y=cell.y+d.y;
+        if(!tailSearchCellOpen(x,y,s,blockedBody)) continue;
+        exits++;
+        const key=`${x},${y}`;
+        if(visited.has(key)) continue;
+        visited.set(key,cell.depth+1);
+        recentTouches+=recentCounts.get(key)||0;
+        queue.push({x,y,depth:cell.depth+1});
+      }
+      if(exits>=3) junctions++;
+    }
+
+    const neededRunway=Math.min(28,Math.max(6,s.body.length+2));
+    const straight=option.x===g.dir.x&&option.y===g.dir.y;
+    const turnExperience=Math.min(16,(s.reverseSteps||0)*0.8);
+    const failureExperience=Math.min(18,(s.tailGuideFailures||0)*6);
+
+    return Math.min(visited.size,neededRunway*4)*1.6
+      + Math.min(maxDepth,neededRunway)*3
+      + (maxDepth>=neededRunway?36:0)
+      + Math.min(junctions,5)*5
+      - recentTouches*22
+      + (straight?3:turnExperience+failureExperience+(s.turnBias||0.5)*2);
+  }
+
+  function chooseTailRetreatDirection(s,g,options) {
+    let chosen=options[0];
+    let best=-Infinity;
+    for(const option of options){
+      const score=tailRetreatOptionScore(s,g,option);
+      if(score>best+1e-9){
+        best=score;
+        chosen=option;
+      }else if(Math.abs(score-best)<=1e-9){
+        // Stable per-snake tie breaking avoids frame-to-frame indecision.
+        const optionRank=dirs.indexOf(option);
+        const chosenRank=dirs.indexOf(chosen);
+        const preferHigh=(s.turnBias||0.5)>=0.5;
+        if((preferHigh&&optionRank>chosenRank)||
+           (!preferHigh&&optionRank<chosenRank)) chosen=option;
+      }
+    }
+    return chosen;
   }
 
   function retreatOneStep(s) {
@@ -5763,6 +5935,7 @@ function makeSnake(x,y,len,dir) {
         y:tail.y,
         dir:{x:tail.x-beforeTail.x,y:tail.y-beforeTail.y}
       };
+      s.tailGuideHistory=[{x:tail.x,y:tail.y}];
     }
 
     const g=s.tailGuide;
@@ -5773,10 +5946,20 @@ function makeSnake(x,y,len,dir) {
       return canEnter(g.x+d.x,g.y+d.y,s,true);
     });
 
-    if(!options.length) return false;
+    if(!options.length){
+      s.tailGuideFailures=(s.tailGuideFailures||0)+1;
+      return false;
+    }
 
-    const straight=options.find(d=>d.x===g.dir.x && d.y===g.dir.y);
-    const chosen=straight || chooseForwardDirection(s,options,g);
+    // Look a short distance down every available branch. A straight corridor
+    // remains natural, but a short dead end now loses to a side route with
+    // enough room to pull the complete snake out. Recent cells are penalized
+    // so the invisible guide does not keep rebuilding the same loop.
+    // A normal one-way corridor needs no search at all. The look-ahead runs
+    // only where the tail has an actual decision to make.
+    const chosen=options.length===1
+      ? options[0]
+      : chooseTailRetreatDirection(s,g,options);
 
     const nx=g.x+chosen.x, ny=g.y+chosen.y;
 
@@ -5806,6 +5989,10 @@ function makeSnake(x,y,len,dir) {
     }
 
     s.tailGuide={x:nx,y:ny,dir:{...chosen}};
+    if(!s.tailGuideHistory) s.tailGuideHistory=[];
+    s.tailGuideHistory.push({x:nx,y:ny});
+    if(s.tailGuideHistory.length>64) s.tailGuideHistory.shift();
+    s.tailGuideFailures=0;
     s.reverseSteps=(s.reverseSteps||0)+1;
     return true;
   }
@@ -6898,21 +7085,14 @@ function drawSnakeHead(px,py,dir) {
       return;
     }
 
-    if(k==='a'&&gameMode!==0) setPlayerDirection(player,-1,0);
-    else if(k==='d'&&gameMode!==0) setPlayerDirection(player,1,0);
-    else if(k==='w'&&gameMode!==0) setPlayerDirection(player,0,-1);
-    else if(k==='s'&&gameMode!==0) setPlayerDirection(player,0,1);
-    else if(k==='ArrowLeft'&&gameMode!==0)
-      setPlayerDirection(humanPlayerCount===2?player2:player,-1,0);
-    else if(k==='ArrowRight'&&gameMode!==0)
-      setPlayerDirection(humanPlayerCount===2?player2:player,1,0);
-    else if(k==='ArrowUp'&&gameMode!==0)
-      setPlayerDirection(humanPlayerCount===2?player2:player,0,-1);
-    else if(k==='ArrowDown'&&gameMode!==0)
-      setPlayerDirection(humanPlayerCount===2?player2:player,0,1);
+    if(KEYBOARD_DIRECTIONS[k]) pressKeyboardDirection(k);
     else if(k==='p') paused=!paused;
   });
-  addEventListener('keyup',e=>{keys[e.key.length===1?e.key.toLowerCase():e.key]=false;});
+  addEventListener('keyup',e=>{
+    const k=e.key.length===1?e.key.toLowerCase():e.key;
+    keys[k]=false;
+    if(KEYBOARD_DIRECTIONS[k]) releaseKeyboardDirection(k);
+  });
 
   function setDirectionFromPointer(e){
     if(gameOver||paused||awaitingPlayerSelection) return;
@@ -6921,48 +7101,36 @@ function drawSnakeHead(px,py,dir) {
     const pointerY=(e.clientY-bounds.top)*(canvas.height/bounds.height);
     const candidates=livingHumanPlayers();
     if(!candidates.length) return;
-    const p=candidates.slice().sort((a,b)=>{
-      const av=playerVisualPosition(a),bv=playerVisualPosition(b);
-      const ad=(pointerX-(av.x+0.5)*TILE)**2+
-        (pointerY-(av.y+0.5)*TILE)**2;
-      const bd=(pointerX-(bv.x+0.5)*TILE)**2+
-        (pointerY-(bv.y+0.5)*TILE)**2;
-      return ad-bd;
-    })[0];
-    const visual=playerVisualPosition(p);
-    const playerCenterX=(visual.x+0.5)*TILE;
-    const playerCenterY=(visual.y+0.5)*TILE;
-    const dx=pointerX-playerCenterX;
-    const dy=pointerY-playerCenterY;
-    const targetX=Math.max(0,Math.min(COLS-1,Math.floor(pointerX/TILE)));
-    const targetY=Math.max(0,Math.min(ROWS-1,Math.floor(pointerY/TILE)));
-    const horizontal=targetX===p.x
-      ? null
-      : {x:targetX>p.x?1:-1,y:0};
-    const vertical=targetY===p.y
-      ? null
-      : {x:0,y:targetY>p.y?1:-1};
+    const rawTarget={
+      x:Math.max(0,Math.min(COLS-1,Math.floor(pointerX/TILE))),
+      y:Math.max(0,Math.min(ROWS-1,Math.floor(pointerY/TILE)))
+    };
+    const now=performance.now();
+    const target=MazeBrain.resolveRouteTarget(rawTarget,now);
+    const p=candidates.map(candidate=>{
+      const routeDistance=MazeBrain.routeDistance(candidate,target,now);
+      const visual=playerVisualPosition(candidate);
+      const visualDistance=(pointerX-(visual.x+0.5)*TILE)**2+
+        (pointerY-(visual.y+0.5)*TILE)**2;
+      return {candidate,routeDistance,visualDistance};
+    }).sort((a,b)=>{
+      if(a.routeDistance!==b.routeDistance)
+        return a.routeDistance-b.routeDistance;
+      return a.visualDistance-b.visualDistance;
+    })[0].candidate;
+    /* The nearest player is selected by actual maze distance. Visual distance
+       resolves only an exact route-distance tie. */
 
-    if(!horizontal&&!vertical){
+    if(p.x===target.x&&p.y===target.y){
       p.pointerNavigation=null;
       p.waitingForInput=false;
       return;
     }
 
-    const horizontalFirst=Math.abs(dx)>=Math.abs(dy);
-    const directions=horizontalFirst
-      ? [horizontal,vertical]
-      : [vertical,horizontal];
-    p.pointerNavigation={
-      x:targetX,
-      y:targetY,
-      directions:directions.filter(Boolean),
-      primary:directions.find(Boolean),
-      secondary:directions.filter(Boolean)[1]||null,
-      primaryTaken:false
-    };
+    clearPlayerKeyboardControl(p);
+    p.pointerNavigation={x:target.x,y:target.y};
 
-    const firstStep=pointerNavigationStep(p);
+    const firstStep=pointerNavigationStep(p,now);
     if(firstStep){
       p.nextDir={...firstStep};
       p.waitingForInput=false;
