@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Hyper Viper Remastered v0.99.49.1 - Single Maze &amp; Coordinated Intelligence</title>
+<title>Hyper Viper Remastered v0.99.49.3 - Opportunistic Ally</title>
 <style>
   :root { --px: 3px; }
   * { box-sizing: border-box; }
@@ -55,7 +55,7 @@
 <body>
 <div class="wrap">
   <h1>HYPER VIPER</h1>
-  <div class="sub">Remastered v0.99.49.1 - Single Maze &amp; Coordinated Intelligence</div>
+  <div class="sub">Remastered v0.99.49.3 - Opportunistic Ally</div>
   <canvas class="bitmap-hud" id="bitmapHud" width="512" height="32" aria-label="Player scores, lives, vipers and level"></canvas>
   <canvas id="game" width="512" height="384" aria-label="Hyper Viper game"></canvas>
   <div class="help">
@@ -2518,7 +2518,11 @@
           brainId:nextBrainId++,
           coordinationRole:null,
           targetPlayerId:null,
-          targetPlayerUntil:0
+          targetPlayerUntil:0,
+          routeHistory:[],
+          planDistance:Infinity,
+          planStalls:0,
+          planTargetKey:''
         };
       }
       return entity.brainState;
@@ -2604,6 +2608,15 @@
       const state=stateFor(entity,t);
       const intelligence=evolvingIntelligence(profile,t);
       const population=attackerPopulation();
+
+      // Direct chasers always follow the player's current tile. A stale copy
+      // of the player's former position can otherwise look like indifference
+      // in fast late-level play.
+      if(state.planType==='coordinate-center'||
+         state.planType==='coordinate-strike'||state.planType==='chase'){
+        state.target={x:targetPlayer.x,y:targetPlayer.y};
+      }
+
       if(!state.target||t>=state.planUntil){
         const role=coordinationRole(state);
         const canCoordinate=population>=3&&intelligence>0&&
@@ -2629,9 +2642,10 @@
             },t);
             state.planType=role===1?'coordinate-left':'coordinate-right';
           }
-          // Mature plans last longer, so flankers do not change their minds at
-          // every intersection while travelling around opposite sides.
-          state.planUntil=t+2200+intelligence*3800+Math.random()*900;
+          // A clever group refreshes the moving player's position more often,
+          // while the role itself remains stable. This keeps flankers decisive
+          // without sending them toward a six-second-old destination.
+          state.planUntil=t+1000+(1-intelligence)*1800+Math.random()*700;
         }else{
           // A lone evolved hunter strongly favours the true shortest route.
           // The old exotic ambush remains possible, mostly in the early game.
@@ -2663,11 +2677,47 @@
 
       // If an ambush point cannot be reached from this part of the maze,
       // immediately fall back to the player's real position.
-      const plannedField=fieldFor(state.target,t);
-      if(plannedField[index(origin.x,origin.y)]<0){
+      let plannedField=fieldFor(state.target,t);
+      let plannedDistance=plannedField[index(origin.x,origin.y)];
+      if(plannedDistance<0){
         state.target={x:targetPlayer.x,y:targetPlayer.y};
         state.planType='chase';
         state.planUntil=t+900;
+        plannedField=fieldFor(state.target,t);
+        plannedDistance=plannedField[index(origin.x,origin.y)];
+      }
+
+      const targetKey=`${state.target.x},${state.target.y}`;
+      if(state.planTargetKey===targetKey){
+        if(plannedDistance>=state.planDistance) state.planStalls++;
+        else state.planStalls=0;
+      }else{
+        state.planTargetKey=targetKey;
+        state.planStalls=0;
+      }
+      state.planDistance=plannedDistance;
+
+      const coordinatedFlank=state.planType==='coordinate-left'||
+        state.planType==='coordinate-right';
+      const playerDistance=fieldFor(
+        {x:targetPlayer.x,y:targetPlayer.y},t
+      )[index(origin.x,origin.y)];
+      const strikeRange=4+Math.round(intelligence*4);
+
+      // A flank point is only an approach waypoint, never a place to orbit.
+      // Reaching it, getting close to the player, or failing to make progress
+      // converts the plan immediately into a direct strike.
+      if(coordinatedFlank&&(
+        plannedDistance<=1||
+        (playerDistance>=0&&playerDistance<=strikeRange)||
+        state.planStalls>=3
+      )){
+        state.target={x:targetPlayer.x,y:targetPlayer.y};
+        state.planType='coordinate-strike';
+        state.planUntil=t+700+(1-intelligence)*700;
+        state.planTargetKey=`${state.target.x},${state.target.y}`;
+        state.planDistance=playerDistance;
+        state.planStalls=0;
       }
       return state.target;
     }
@@ -2709,45 +2759,40 @@
         ? {x:targetPlayer.x,y:targetPlayer.y}
         : tacticalTarget(entity,origin,profile,attention,targetPlayer,t);
       const field=fieldFor(target,t);
+      const originKey=`${origin.x},${origin.y}`;
+      state.routeHistory.push(originKey);
+      if(state.routeHistory.length>16) state.routeHistory.shift();
       const ranked=options.map(d=>{
         const nx=origin.x+d.x,ny=origin.y+d.y;
         const distance=field[index(nx,ny)];
         const straightBonus=straight===d ? 0.16 : 0;
         const repeatPenalty=state.lastChoice&&
           state.lastChoice.x===-d.x&&state.lastChoice.y===-d.y ? 0.22 : 0;
+        const nextKey=`${nx},${ny}`;
+        const recentVisits=state.routeHistory.reduce(
+          (count,key)=>count+(key===nextKey?1:0),0
+        );
+        const loopPenalty=recentVisits*(0.8+intelligence*3.2);
         return {
           d,
           score:(distance<0?10000:(fleeing?-distance:distance))-
-            straightBonus+repeatPenalty
+            straightBonus+repeatPenalty+loopPenalty
         };
       }).sort((a,b)=>a.score-b.score);
 
       let choice=ranked[0];
-      let coordinatedChoice=false;
-
-      // With at least three attackers, the stable roles divide viable routes.
-      // The leader keeps the best direct path; flankers may accept a controlled
-      // detour so that the group approaches from different passages.
-      const role=coordinationRole(state);
       const coordinatedPlan=typeof state.planType==='string'&&
         state.planType.startsWith('coordinate-');
-      if(!fleeing&&coordinatedPlan&&role>0&&ranked.length>1&&
-         Math.random()<coordinationChanceForIntelligence(intelligence)){
-        const maximumDetour=2+intelligence*10;
-        const alternatives=ranked.slice(1).filter(item=>
-          item.score<10000&&item.score<=ranked[0].score+maximumDetour
-        );
-        if(alternatives.length){
-          const alternativeIndex=(role-1)%alternatives.length;
-          choice=alternatives[alternativeIndex];
-          coordinatedChoice=true;
-        }
-      }
+
+      // Route diversity comes from the distinct center/left/right targets.
+      // Once a role has a target, every step toward it uses the best route.
+      // Deliberately choosing the second-best step here caused short snakes
+      // to orbit forever inside 2x2 and 3x3 open cells.
 
       // A highly alert inhabitant occasionally commits to the second viable
       // route. This is intentional flanking, not an error: it can disappear
       // behind a wall and approach from another passage.
-      if(!fleeing&&!coordinatedPlan&&!coordinatedChoice&&
+      if(!fleeing&&!coordinatedPlan&&
          attention>0.68&&t>=state.surpriseAt&&ranked.length>1){
         state.surpriseAt=t+10000+Math.random()*16000;
         if(Math.random()<0.24){
@@ -3766,12 +3811,18 @@
           :[];
         currentCandidates.sort((a,b)=>a.score-b.score);
         const current=currentCandidates[0]||null;
-        // Do not change prey because another route became one or two cells
-        // shorter for a moment. In calm play the alternative must improve the
-        // plan by more than six cells; under pressure the margin contracts so
-        // survival and a clearly easier nearby snake can still take over.
-        const switchMargin=pressured?2.5:6;
+        // Keep minor one- or two-cell fluctuations stable, but seize a clearly
+        // better tail or split much sooner than before. Once a new opportunity
+        // is chosen, briefly cool down the old unbitten snake so moving targets
+        // cannot cause an immediate A-B-A reversal on the following decision.
+        const switchMargin=pressured?1.25:3.25;
         if(current&&current.score<=best.score+switchMargin) return current;
+        if(current&&best.details?.snake&&
+           best.details.snake!==current.details?.snake){
+          p.aiTargetCooldowns.set(current.details.snake,t+1600);
+          best.details.opportunisticSwitch=true;
+          best.details.opportunityGain=current.score-best.score;
+        }
         return best;
       }
 
