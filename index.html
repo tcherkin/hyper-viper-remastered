@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Hyper Viper Remastered v0.99.49.7 - Web Audio Engine</title>
+<title>Hyper Viper Remastered v0.99.49.10 - Sixteen Total Audio Voices</title>
 <style>
   :root { --px: 3px; }
   * { box-sizing: border-box; }
@@ -55,7 +55,7 @@
 <body>
 <div class="wrap">
   <h1>HYPER VIPER</h1>
-  <div class="sub">Remastered v0.99.49.7 - Web Audio Engine</div>
+  <div class="sub">Remastered v0.99.49.10 - Sixteen Total Audio Voices</div>
   <canvas class="bitmap-hud" id="bitmapHud" width="512" height="32" aria-label="Player scores, lives, vipers and level"></canvas>
   <canvas id="game" width="512" height="384" aria-label="Hyper Viper game"></canvas>
   <div class="help">
@@ -173,7 +173,7 @@
     primePromise:null,
     activeVoices:[],
     lastGroupStart:Object.create(null),
-    maxVoices:12,
+    maxVoices:16,
     fallbackPools:Object.create(null),
     fallbackCursors:Object.create(null),
 
@@ -315,7 +315,7 @@
     policy(name){
       if(name==='Tie1'||name==='Tie2'||name==='Tie3'||
          name==='Tie5'||name==='TieEat'){
-        return {group:'body',limit:4,minInterval:28,priority:1};
+        return {group:'body',limit:8,minInterval:0,priority:1};
       }
       if(name==='EatFruit1'||name==='EatFruit2'||name==='EatFruit3')
         return {group:'fruit',limit:2,minInterval:32,priority:1};
@@ -324,7 +324,7 @@
       if(name==='EggKnock')
         return {group:'egg',limit:2,minInterval:38,priority:2};
       if(name==='HeadEat')
-        return {group:'head',limit:4,minInterval:18,priority:3};
+        return {group:'head',limit:8,minInterval:0,priority:3};
       return {group:'critical',limit:5,minInterval:0,priority:4};
     },
 
@@ -368,8 +368,9 @@
       const now=performance.now();
       const last=this.lastGroupStart[policy.group]??-Infinity;
 
-      // Only practically simultaneous low-priority sounds are coalesced.
-      // One powered player's normal 47.5 ms bite cadence remains fully audible.
+      // Bite sounds deliberately have no minimum interval: every eaten body,
+      // tail or head segment gets its own arcade sound. The eight-voice group
+      // voice limits still prevent expensive unbounded overlap on mobile.
       if(policy.minInterval&&now-last<policy.minInterval) return false;
       if(!this.makeVoiceRoom(policy)) return false;
 
