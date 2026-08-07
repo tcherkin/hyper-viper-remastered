@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Hyper Viper Remastered v0.99.49.6 - Dead Code Cleanup</title>
+<title>Hyper Viper Remastered v0.99.49.7 - Web Audio Engine</title>
 <style>
   :root { --px: 3px; }
   * { box-sizing: border-box; }
@@ -55,7 +55,7 @@
 <body>
 <div class="wrap">
   <h1>HYPER VIPER</h1>
-  <div class="sub">Remastered v0.99.49.6 - Dead Code Cleanup</div>
+  <div class="sub">Remastered v0.99.49.7 - Web Audio Engine</div>
   <canvas class="bitmap-hud" id="bitmapHud" width="512" height="32" aria-label="Player scores, lives, vipers and level"></canvas>
   <canvas id="game" width="512" height="384" aria-label="Hyper Viper game"></canvas>
   <div class="help">
@@ -166,62 +166,320 @@
   const SoundManager={
     enabled:true,
     volume:0.72,
-    pools:Object.create(null),
-    cursors:Object.create(null),
-    poolSize(name){
-      // Body bites can arrive several times per second. Two reusable channels
-      // preserve their overlap without allocating and decoding a fresh WAV on
-      // every eaten segment (a particularly expensive path in iOS Safari).
+    context:null,
+    masterGain:null,
+    buffers:new Map(),
+    decodePromises:new Map(),
+    primePromise:null,
+    activeVoices:[],
+    lastGroupStart:Object.create(null),
+    maxVoices:12,
+    fallbackPools:Object.create(null),
+    fallbackCursors:Object.create(null),
+
+    audioContextConstructor(){
+      return globalThis.AudioContext||globalThis.webkitAudioContext||null;
+    },
+
+    ensureContext(){
+      if(this.context) return true;
+      const AudioContextClass=this.audioContextConstructor();
+      if(!AudioContextClass) return false;
+      try{
+        try{
+          this.context=new AudioContextClass({latencyHint:'interactive'});
+        }catch(_optionsError){
+          this.context=new AudioContextClass();
+        }
+        this.masterGain=this.context.createGain();
+        this.masterGain.gain.value=this.volume;
+        this.masterGain.connect(this.context.destination);
+        return true;
+      }catch(_error){
+        this.context=null;
+        this.masterGain=null;
+        return false;
+      }
+    },
+
+    unlock(){
+      if(!this.ensureContext()) return Promise.resolve(false);
+      if(this.context.state==='running') return Promise.resolve(true);
+      try{
+        const resumed=this.context.resume?.();
+        return resumed?.then
+          ? resumed.then(()=>this.context.state==='running').catch(()=>false)
+          : Promise.resolve(this.context.state==='running');
+      }catch(_error){
+        return Promise.resolve(false);
+      }
+    },
+
+    dataUriArrayBuffer(uri){
+      const comma=uri.indexOf(',');
+      const binary=atob(comma>=0?uri.slice(comma+1):uri);
+      const bytes=new Uint8Array(binary.length);
+      for(let i=0;i<binary.length;i++) bytes[i]=binary.charCodeAt(i);
+      return bytes.buffer;
+    },
+
+    decode(name){
+      if(this.buffers.has(name))
+        return Promise.resolve(this.buffers.get(name));
+      if(this.decodePromises.has(name)) return this.decodePromises.get(name);
+      if(!SOUND_DATA[name]||!this.ensureContext())
+        return Promise.reject(new Error('Web Audio unavailable'));
+
+      let encoded;
+      try{
+        encoded=this.dataUriArrayBuffer(SOUND_DATA[name]);
+      }catch(error){
+        return Promise.reject(error);
+      }
+
+      const promise=new Promise((resolve,reject)=>{
+        let settled=false;
+        const complete=buffer=>{
+          if(settled) return;
+          settled=true;
+          this.buffers.set(name,buffer);
+          resolve(buffer);
+        };
+        const fail=error=>{
+          if(settled) return;
+          settled=true;
+          reject(error||new Error(`Could not decode ${name}`));
+        };
+        try{
+          // Supplying callbacks as well as accepting the returned Promise keeps
+          // this compatible with both current browsers and older iOS Safari.
+          const result=this.context.decodeAudioData(
+            encoded.slice(0),complete,fail
+          );
+          result?.then?.(complete,fail);
+        }catch(error){
+          fail(error);
+        }
+      }).finally(()=>this.decodePromises.delete(name));
+
+      this.decodePromises.set(name,promise);
+      return promise;
+    },
+
+    priorityOrder(){
+      const first=[
+        'Tie1','Tie2','Tie3','Tie5','TieEat','HeadEat',
+        'EatFruit1','EatFruit2','EatFruit3','HeadDie','Tick',
+        'BonusLife@','Game_Over','Congratulations','Oh_No'
+      ];
+      return [...first,...Object.keys(SOUND_DATA).filter(
+        name=>!first.includes(name)
+      )];
+    },
+
+    prime(){
+      if(this.primePromise) return this.primePromise;
+      if(!this.ensureContext()){
+        // A very old browser keeps the previous HTMLAudioElement route.
+        this.priorityOrder().forEach(name=>this.ensureFallbackPool(name,true));
+        this.primePromise=Promise.resolve(false);
+        return this.primePromise;
+      }
+
+      // Decode once while the mode-selection screen is visible. Sequential
+      // decoding prevents a burst of 24 simultaneous decoder jobs on iOS,
+      // while the bite and head sounds are deliberately first in the queue.
+      this.primePromise=(async()=>{
+        let decoded=0;
+        for(const name of this.priorityOrder()){
+          try{
+            await this.decode(name);
+            decoded++;
+          }catch(_error){
+            // A failed individual sound can still use the legacy fallback.
+          }
+        }
+        return decoded>0;
+      })();
+      return this.primePromise;
+    },
+
+    prepareGameplay(){
+      // The mode-selection click/key is the iOS permission gesture. Decoding
+      // has normally already finished in the background; this resumes the one
+      // long-lived mixer rather than opening media channels during a bite.
+      this.unlock();
+      return this.prime();
+    },
+
+    policy(name){
+      if(name==='Tie1'||name==='Tie2'||name==='Tie3'||
+         name==='Tie5'||name==='TieEat'){
+        return {group:'body',limit:4,minInterval:28,priority:1};
+      }
+      if(name==='EatFruit1'||name==='EatFruit2'||name==='EatFruit3')
+        return {group:'fruit',limit:2,minInterval:32,priority:1};
+      if(name==='Tick')
+        return {group:'tick',limit:1,minInterval:60,priority:1};
+      if(name==='EggKnock')
+        return {group:'egg',limit:2,minInterval:38,priority:2};
+      if(name==='HeadEat')
+        return {group:'head',limit:4,minInterval:18,priority:3};
+      return {group:'critical',limit:5,minInterval:0,priority:4};
+    },
+
+    finishVoice(voice){
+      if(!voice?.active) return;
+      voice.active=false;
+      voice.source.onended=null;
+      try{ voice.source.disconnect?.(); }catch(_error){}
+      const index=this.activeVoices.indexOf(voice);
+      if(index>=0) this.activeVoices.splice(index,1);
+    },
+
+    stopVoice(voice){
+      if(!voice?.active) return;
+      try{ voice.source.stop?.(); }catch(_error){}
+      this.finishVoice(voice);
+    },
+
+    makeVoiceRoom(policy){
+      const inGroup=this.activeVoices.filter(
+        voice=>voice.active&&voice.group===policy.group
+      );
+      while(inGroup.length>=policy.limit){
+        const oldest=inGroup.shift();
+        this.stopVoice(oldest);
+      }
+
+      while(this.activeVoices.length>=this.maxVoices){
+        const replaceable=this.activeVoices.find(
+          voice=>voice.active&&voice.priority<=policy.priority
+        );
+        if(!replaceable) return false;
+        this.stopVoice(replaceable);
+      }
+      return true;
+    },
+
+    playBuffer(name,buffer,requestedAt=performance.now()){
+      if(!this.enabled||!buffer||!this.context||!this.masterGain) return false;
+      const policy=this.policy(name);
+      const now=performance.now();
+      const last=this.lastGroupStart[policy.group]??-Infinity;
+
+      // Only practically simultaneous low-priority sounds are coalesced.
+      // One powered player's normal 47.5 ms bite cadence remains fully audible.
+      if(policy.minInterval&&now-last<policy.minInterval) return false;
+      if(!this.makeVoiceRoom(policy)) return false;
+
+      let source;
+      try{
+        source=this.context.createBufferSource();
+        source.buffer=buffer;
+        source.connect(this.masterGain);
+      }catch(_error){
+        return false;
+      }
+
+      const voice={
+        source,group:policy.group,priority:policy.priority,
+        requestedAt,startedAt:now,active:true
+      };
+      source.onended=()=>this.finishVoice(voice);
+      this.activeVoices.push(voice);
+      this.lastGroupStart[policy.group]=now;
+      try{
+        source.start(0);
+        return true;
+      }catch(_error){
+        this.finishVoice(voice);
+        return false;
+      }
+    },
+
+    fallbackPoolSize(name){
       return name==='Tie1'||name==='Tie2'||name==='Tie3'||
         name==='Tie5'||name==='TieEat' ? 2 : 1;
     },
-    ensurePool(name,warm=false){
-      if(!SOUND_DATA[name]) return null;
-      let pool=this.pools[name];
+
+    ensureFallbackPool(name,warm=false){
+      if(!SOUND_DATA[name]||typeof Audio==='undefined') return null;
+      let pool=this.fallbackPools[name];
       if(!pool){
         pool=[];
-        const count=this.poolSize(name);
+        const count=this.fallbackPoolSize(name);
         for(let i=0;i<count;i++){
           const audio=new Audio(SOUND_DATA[name]);
           audio.preload='auto';
           pool.push(audio);
         }
-        this.pools[name]=pool;
-        this.cursors[name]=0;
+        this.fallbackPools[name]=pool;
+        this.fallbackCursors[name]=0;
       }
-      if(warm){
-        pool.forEach(audio=>{
-          try{ audio.load?.(); }catch(_error){}
-        });
-      }
+      if(warm) pool.forEach(audio=>{
+        try{ audio.load?.(); }catch(_error){}
+      });
       return pool;
     },
-    prepareGameplay(){
-      // Move the one-off data-URI parsing and audio preparation to the mode
-      // selection gesture, before movement begins, instead of the first bite.
-      [
-        'Tie1','Tie2','Tie3','Tie5','TieEat','HeadEat',
-        'EatFruit1','EatFruit2','EatFruit3'
-      ].forEach(name=>this.ensurePool(name,true));
-    },
-    play(name){
-      if(!this.enabled || !SOUND_DATA[name]) return;
-      const pool=this.ensurePool(name);
-      if(!pool?.length) return;
-      const cursor=this.cursors[name]||0;
+
+    fallbackPlay(name){
+      const pool=this.ensureFallbackPool(name);
+      if(!pool?.length) return false;
+      const cursor=this.fallbackCursors[name]||0;
       const audio=pool[cursor%pool.length];
-      this.cursors[name]=(cursor+1)%pool.length;
+      this.fallbackCursors[name]=(cursor+1)%pool.length;
       audio.volume=this.volume;
       try{
         audio.pause?.();
         audio.currentTime=0;
-      }catch(_error){}
-      try{
         const playback=audio.play();
         playback?.catch?.(()=>{});
-      }catch(_error){}
+        return true;
+      }catch(_error){
+        return false;
+      }
+    },
+
+    play(name){
+      if(!this.enabled||!SOUND_DATA[name]) return false;
+      if(!this.ensureContext()) return this.fallbackPlay(name);
+
+      // resume() is immediate after an accepted gesture and harmless while
+      // already running. It also repairs an interrupted iOS context after the
+      // user returns from the lock screen or another application.
+      if(this.context.state!=='running') this.unlock();
+      const buffer=this.buffers.get(name);
+      if(buffer) return this.playBuffer(name,buffer);
+
+      // Normally prime() has decoded every effect before play begins. If a
+      // player starts exceptionally quickly, decode only this requested sound
+      // and play it while the event is still perceptually current. Never fall
+      // back to a media element merely because Web Audio is a few ms early.
+      const requestedAt=performance.now();
+      this.decode(name).then(decoded=>{
+        if(performance.now()-requestedAt<=120)
+          this.playBuffer(name,decoded,requestedAt);
+      }).catch(()=>this.fallbackPlay(name));
+      return true;
+    },
+
+    diagnostics(){
+      return {
+        engine:this.context?'web-audio':'html-audio-fallback',
+        state:this.context?.state||'unavailable',
+        decoded:this.buffers.size,
+        total:Object.keys(SOUND_DATA).length,
+        activeVoices:this.activeVoices.filter(voice=>voice.active).length,
+        maxVoices:this.maxVoices
+      };
     }
   };
+
+  // Begin one-time decoding while the player is reading the opening menu.
+  // Playback remains locked until a genuine click, tap or key selection.
+  SoundManager.prime();
+  globalThis.__hyperViperAudioDiagnostics=()=>SoundManager.diagnostics();
 
   function playSound(name){ SoundManager.play(name); }
 
@@ -6972,7 +7230,12 @@ function drawSnakeHead(px,py,dir) {
     requestAnimationFrame(loop);
   }
 
+  document.addEventListener?.('visibilitychange',()=>{
+    if(!document.hidden) SoundManager.unlock();
+  });
+
   addEventListener('keydown',e=>{
+    SoundManager.unlock();
     const k=e.key.length===1?e.key.toLowerCase():e.key;
     keys[k]=true;
     if(['ArrowUp','ArrowDown','ArrowLeft','ArrowRight',' '].includes(e.key)) e.preventDefault();
@@ -7047,6 +7310,7 @@ function drawSnakeHead(px,py,dir) {
 
   canvas.addEventListener('pointerdown',e=>{
     e.preventDefault();
+    SoundManager.unlock();
     setDirectionFromPointer(e);
   });
 
